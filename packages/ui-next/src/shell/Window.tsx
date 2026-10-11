@@ -224,9 +224,8 @@ export function Window({
   useEffect(() => {
     if (!booted) return;
     countLaunch();
-    // The skills that are on for every conversation (#851), once settings are
-    // readable. It cannot reject: a list it could not read is a shorter list.
-    void applySkillDefaults();
+    // The skills the reader keeps on (#851), once settings are readable.
+    applySkillDefaults();
   }, [booted]);
   useStarCountRefresh(booted);
 
