@@ -13,7 +13,13 @@ import {
 } from "@srelens/core";
 import { Badge, Button, ConfirmDialog, Dialog, EmptyState, Field, Switch, TextInput } from "@srelens/ui-kit";
 import { FailureAlert } from "../../lib/errorCopy";
-import { estimateTokens, formatTokens, setSkillDefault, useSkillDefaults } from "../../lib/skillDefaults";
+import {
+  estimateTokens,
+  formatTokens,
+  refreshSkillDefaults,
+  setSkillDefault,
+  useSkillDefaults,
+} from "../../lib/skillDefaults";
 import { useSkillUses } from "../../lib/skillUses";
 
 /** A skill as this pane lists it: what it is, and what it costs to have on. */
@@ -70,6 +76,8 @@ export function SkillsPane() {
   useEffect(() => {
     let current = true;
     setRead({ state: "loading" });
+    // Another window may have changed what is kept since this one started.
+    void refreshSkillDefaults();
     void (async () => {
       try {
         const metas = await listSkills();
@@ -146,7 +154,8 @@ export function SkillsPane() {
         <p className="mt-1 max-w-[70ch] text-muted">
           Short runbooks the agent follows: how to triage a crash loop, what to check before a rollout is called
           stuck. A skill that is on is sent with every question, in every new conversation, until you turn it off.
-          You can still switch one on or off for a single conversation from the agent screen.
+          The switches on the agent screen are separate: they turn a skill on or off for the conversations in that
+          window until it is closed, and do not change what is kept here.
         </p>
       </section>
 
@@ -189,7 +198,10 @@ export function SkillsPane() {
           <span className="text-muted">a folder that could not be found.</span>
         ) : (
           // Selectable, so it can be copied into a terminal or an editor.
-          <code className="min-w-0 select-all break-all font-mono text-[0.75rem] text-ink" data-slot="skills-folder">
+          <code
+            className="min-w-0 max-w-full select-all overflow-x-auto whitespace-nowrap font-mono text-[0.75rem] text-ink"
+            data-slot="skills-folder"
+          >
             {folder}
           </code>
         )}
@@ -232,12 +244,12 @@ export function SkillsPane() {
           hint={skills.length === 0 ? "Install one with Install skill…" : `Nothing installed matches “${query.trim()}”.`}
         />
       ) : (
-        <ul className="flex flex-col gap-2 px-4 py-3" aria-label="Installed skills">
+        <ul aria-label="Installed skills">
           {shown.map((skill) => {
             const isOn = on.includes(skill.name);
             const used = uses[skill.name] ?? 0;
             return (
-              <li key={skill.name} className="rounded-md border border-rule px-3 py-2.5" data-skill={skill.name}>
+              <li key={skill.name} className="border-b border-rule px-4 py-2.5" data-skill={skill.name}>
                 <div className="flex items-start gap-3">
                   <div className="min-w-0 flex-1">
                     <p className="flex flex-wrap items-center gap-2">
@@ -249,7 +261,10 @@ export function SkillsPane() {
                     {/* The file itself, where there is one: what to open to
                         change this skill by hand. */}
                     {skill.path ? (
-                      <p className="mt-1 select-all break-all font-mono text-[0.75rem] text-muted" data-slot="skill-path">
+                      <p
+                        className="mt-1 select-all overflow-x-auto whitespace-nowrap font-mono text-[0.75rem] text-muted"
+                        data-slot="skill-path"
+                      >
                         {skill.path}
                       </p>
                     ) : (

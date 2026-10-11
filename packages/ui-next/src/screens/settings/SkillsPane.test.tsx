@@ -15,7 +15,12 @@ const setSkillActive = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/agentRun", () => ({ setSkillActive }));
 
 import { settingsStorage } from "@srelens/core";
-import { SKILL_DEFAULTS_KEY, __resetSkillDefaultsForTests, getSkillDefaults } from "../../lib/skillDefaults";
+import {
+  SKILL_DEFAULTS_KEY,
+  __resetSkillDefaultsForTests,
+  getSkillDefaults,
+  skillDefaultsSaved,
+} from "../../lib/skillDefaults";
 import { SkillsPane } from "./SkillsPane";
 
 /** Bodies sized so the estimates are round: a quarter of the characters. */
@@ -68,6 +73,37 @@ describe("SkillsPane", () => {
     expect(within(card("crashloop-triage")).getByText("Preinstalled")).toBeDefined();
     expect(within(card("crashloop-triage")).getByText(/^Ships with srelens\./)).toBeDefined();
     expect(within(card("team-runbook")).getByText("Installed by you")).toBeDefined();
+  });
+
+  /**
+   * The agent screen's switches are for the window, not for one conversation:
+   * they survive New question. The page said "a single conversation".
+   */
+  it("says what the agent screen's switches do, and does not promise one conversation", async () => {
+    await shown();
+    expect(screen.getByText(/for the conversations in that\s+window until it is closed/)).toBeDefined();
+    expect(screen.queryByText(/single conversation/)).toBeNull();
+  });
+
+  /** Edge to edge: adjoining rows on hairlines, not floating cards. */
+  it("lists the skills as adjoining rows, not as cards", async () => {
+    await shown();
+    const row = card("team-runbook");
+    expect(row.className).toContain("border-b");
+    expect(row.className).not.toMatch(/rounded|(^| )border( |$)/);
+    expect(row.parentElement?.className ?? "").not.toMatch(/gap-|p[xy]?-/);
+  });
+
+  /** Machine text does not wrap: a path runs on one line and scrolls. */
+  it("lets a path run on one line and scroll, rather than wrapping it", async () => {
+    await shown();
+    await screen.findByText(FOLDER);
+    for (const slot of ["skills-folder", "skill-path"]) {
+      const path = document.querySelector(`[data-slot="${slot}"]`) as HTMLElement;
+      expect(path.className).toContain("whitespace-nowrap");
+      expect(path.className).toContain("overflow-x-auto");
+      expect(path.className).not.toContain("break-all");
+    }
   });
 
   it("says about how many tokens each skill adds when it is on", async () => {

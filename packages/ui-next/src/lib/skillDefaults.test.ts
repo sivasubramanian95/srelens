@@ -3,6 +3,8 @@ import { settingsStorage } from "@srelens/core";
 
 const setSkillActive = vi.hoisted(() => vi.fn());
 vi.mock("./agentRun", () => ({ setSkillActive }));
+const refreshSetting = vi.hoisted(() => vi.fn());
+vi.mock("@srelens/core", async (orig) => ({ ...(await orig<typeof import("@srelens/core")>()), refreshSetting }));
 
 import {
   SKILL_DEFAULTS_KEY,
@@ -12,14 +14,24 @@ import {
   formatTokens,
   getSkillDefaults,
   parseSkillDefaults,
+  refreshSkillDefaults,
   setSkillDefault,
+  skillDefaultsSaved,
 } from "./skillDefaults";
 
 beforeEach(() => {
   settingsStorage.removeItem(SKILL_DEFAULTS_KEY);
   __resetSkillDefaultsForTests();
   setSkillActive.mockReset();
+  refreshSetting.mockReset().mockResolvedValue(undefined);
 });
+
+/** Another window keeping its own choice, seen when this one looks again. */
+function anotherWindowKeeps(names: string[]): void {
+  refreshSetting.mockImplementationOnce(async () => {
+    settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(names));
+  });
+}
 
 describe("parseSkillDefaults", () => {
   it("is no names for nothing, for junk, and for the wrong shape", () => {
@@ -50,16 +62,19 @@ describe("the kept skills", () => {
     expect(getSkillDefaults()).toEqual([]);
   });
 
-  it("keep a skill turned on, across a restart", () => {
+  it("keep a skill turned on, across a restart", async () => {
     setSkillDefault("oomkilled", true);
+    expect(getSkillDefaults()).toEqual(["oomkilled"]);
+    await skillDefaultsSaved();
     __resetSkillDefaultsForTests();
     expect(getSkillDefaults()).toEqual(["oomkilled"]);
   });
 
-  it("forget a skill turned off, and only that one", () => {
+  it("forget a skill turned off, and only that one", async () => {
     setSkillDefault("oomkilled", true);
     setSkillDefault("pending-pod", true);
     setSkillDefault("oomkilled", false);
+    await skillDefaultsSaved();
     __resetSkillDefaultsForTests();
     expect(getSkillDefaults()).toEqual(["pending-pod"]);
   });
@@ -79,14 +94,54 @@ describe("the kept skills", () => {
     expect(setSkillActive).not.toHaveBeenCalled();
   });
 
-  it("hold for the session when storage refuses the write", () => {
+  it("hold for the session when storage refuses the write", async () => {
     const refuse = vi.spyOn(settingsStorage, "setItem").mockImplementation(() => {
       throw new Error("Settings backend is unavailable");
     });
     setSkillDefault("oomkilled", true);
+    await skillDefaultsSaved();
     refuse.mockRestore();
     expect(getSkillDefaults()).toEqual(["oomkilled"]);
     expect(setSkillActive).toHaveBeenCalledWith("oomkilled", true);
+  });
+});
+
+/**
+ * Each window loads what is kept once and used to write its whole copy back.
+ * With `oomkilled` turned on in one window and `pending-pod` then turned on in
+ * another, the second write carried only `pending-pod` and the first choice
+ * was gone at the next launch.
+ */
+describe("a choice made in another window", () => {
+  it("is not undone by turning a different skill on here", async () => {
+    anotherWindowKeeps(["oomkilled"]);
+    setSkillDefault("pending-pod", true);
+    await skillDefaultsSaved();
+    expect(parseSkillDefaults(settingsStorage.getItem(SKILL_DEFAULTS_KEY))).toEqual(["oomkilled", "pending-pod"]);
+    expect(getSkillDefaults()).toEqual(["oomkilled", "pending-pod"]);
+  });
+
+  it("is not brought back by turning a different skill off here", async () => {
+    settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(["oomkilled", "pending-pod"]));
+    anotherWindowKeeps(["pending-pod"]);
+    setSkillDefault("pending-pod", false);
+    await skillDefaultsSaved();
+    expect(parseSkillDefaults(settingsStorage.getItem(SKILL_DEFAULTS_KEY))).toEqual([]);
+  });
+
+  it("is shown here once this window looks again", async () => {
+    anotherWindowKeeps(["oomkilled"]);
+    await refreshSkillDefaults();
+    expect(getSkillDefaults()).toEqual(["oomkilled"]);
+    // Shown, not applied: what is on in this window's conversations is its own.
+    expect(setSkillActive).not.toHaveBeenCalled();
+  });
+
+  it("does not cost this window its own choice when the backend cannot be read again", async () => {
+    refreshSetting.mockRejectedValueOnce(new Error("backend gone"));
+    setSkillDefault("oomkilled", true);
+    await skillDefaultsSaved();
+    expect(parseSkillDefaults(settingsStorage.getItem(SKILL_DEFAULTS_KEY))).toEqual(["oomkilled"]);
   });
 });
 

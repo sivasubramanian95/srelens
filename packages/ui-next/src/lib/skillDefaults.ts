@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { settingsStorage } from "@srelens/core";
+import { refreshSetting, settingsStorage } from "@srelens/core";
 import { setSkillActive } from "./agentRun";
 
 /**
@@ -61,21 +61,77 @@ export function useSkillDefaults(): readonly string[] {
   return useSyncExternalStore(subscribe, read, read);
 }
 
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+/**
+ * What is kept, as the backend has it now — or, when it cannot be asked, as
+ * this window's copy of the settings has it.
+ */
+async function latest(): Promise<readonly string[]> {
+  try {
+    await refreshSetting(SKILL_DEFAULTS_KEY);
+  } catch {
+    // Not readable again: this window's copy is the best there is.
+  }
+  try {
+    return parseSkillDefaults(settingsStorage.getItem(SKILL_DEFAULTS_KEY));
+  } catch {
+    return [];
+  }
+}
+
+/** Saves run one after another, each on top of what the one before it kept. */
+let saving: Promise<void> = Promise.resolve();
+
 /**
  * Turn a skill on or off for every new conversation — and for this window's
  * next question too, so the switch does what it says without a restart.
+ *
+ * The switch moves at once. What is written is this one change made to the
+ * list as it is kept now, not to the list this window loaded at start: another
+ * window may have turned a different skill on since, and writing this window's
+ * copy would silently turn that one off again.
  */
 export function setSkillDefault(name: string, on: boolean): void {
-  const current = read();
-  if (current.includes(name) === on) return;
-  defaults = on ? [...current, name] : current.filter((n) => n !== name);
-  try {
-    settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(defaults));
-  } catch {
-    // Storage is unavailable: the choice holds for this session.
-  }
+  const toggled = (list: readonly string[]) =>
+    list.includes(name) === on ? list : on ? [...list, name] : list.filter((n) => n !== name);
+  if (read().includes(name) === on) return;
+  defaults = toggled(read());
   setSkillActive(name, on);
-  for (const listener of listeners) listener();
+  notify();
+  saving = saving.then(async () => {
+    const kept = await latest();
+    const next = toggled(kept);
+    defaults = next;
+    if (next !== kept) {
+      try {
+        settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(next));
+      } catch {
+        // Storage is unavailable: the choice holds for this session.
+      }
+    }
+    notify();
+  });
+}
+
+/**
+ * Look again at what is kept, so a page that shows it shows what another
+ * window chose since this one started. What is on in this window's
+ * conversations does not move: that is this window's until it is restarted.
+ */
+export function refreshSkillDefaults(): Promise<void> {
+  saving = saving.then(async () => {
+    defaults = await latest();
+    notify();
+  });
+  return saving;
+}
+
+/** Resolves when every change made so far has been kept. */
+export function skillDefaultsSaved(): Promise<void> {
+  return saving;
 }
 
 /**
@@ -106,5 +162,6 @@ export function formatTokens(n: number): string {
 /** Forget the in-memory copy so a test starts from storage. */
 export function __resetSkillDefaultsForTests(): void {
   defaults = null;
+  saving = Promise.resolve();
   listeners.clear();
 }
