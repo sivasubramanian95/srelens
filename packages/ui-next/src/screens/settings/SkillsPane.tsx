@@ -13,7 +13,14 @@ import {
 } from "@srelens/core";
 import { Badge, Button, ConfirmDialog, Dialog, EmptyState, Field, Switch, TextInput } from "@srelens/ui-kit";
 import { FailureAlert } from "../../lib/errorCopy";
-import { estimateTokens, formatTokens, setSkillDefault, useSkillDefaults } from "../../lib/skillDefaults";
+import {
+  estimateTokens,
+  forgetSkillDefault,
+  formatTokens,
+  setSkillDefault,
+  skillIsOn,
+  useSkillDefaults,
+} from "../../lib/skillDefaults";
 import { useSkillUses } from "../../lib/skillUses";
 
 /** A skill as this pane lists it: what it is, and what it costs to have on. */
@@ -118,7 +125,7 @@ export function SkillsPane() {
     return skills.filter((s) => s.name.toLowerCase().includes(needle) || s.description.toLowerCase().includes(needle));
   }, [skills, query]);
 
-  const enabled = skills.filter((s) => on.includes(s.name));
+  const enabled = skills.filter((s) => skillIsOn(s, on));
   const cost = enabled.reduce((sum, s) => sum + (s.tokens ?? 0), 0);
   const unsized = enabled.filter((s) => s.tokens === null).length;
 
@@ -130,7 +137,7 @@ export function SkillsPane() {
       // kept set, counted as a choice the reader can no longer see or undo.
       // A copy of a bundled skill is different: the skill is still there, as
       // it shipped, and stays as the reader had it — on or off.
-      if (!skill.overridesBuiltin) setSkillDefault(skill.name, false);
+      if (!skill.overridesBuiltin) forgetSkillDefault(skill.name);
       setRemoving(null);
       setAttempt((n) => n + 1);
     } catch (error) {
@@ -146,7 +153,8 @@ export function SkillsPane() {
         <p className="mt-1 max-w-[70ch] text-muted">
           Short runbooks the agent follows: how to triage a crash loop, what to check before a rollout is called
           stuck. A skill that is on is sent with every question, in every new conversation, until you turn it off.
-          You can still switch one on or off for a single conversation from the agent screen.
+          Preinstalled skills start on; one you install starts off. You can still switch one on or off for a
+          single conversation from the agent screen.
         </p>
       </section>
 
@@ -234,7 +242,7 @@ export function SkillsPane() {
       ) : (
         <ul className="flex flex-col gap-2 px-4 py-3" aria-label="Installed skills">
           {shown.map((skill) => {
-            const isOn = on.includes(skill.name);
+            const isOn = skillIsOn(skill, on);
             const used = uses[skill.name] ?? 0;
             return (
               <li key={skill.name} className="rounded-md border border-rule px-3 py-2.5" data-skill={skill.name}>

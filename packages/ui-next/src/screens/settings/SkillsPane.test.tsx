@@ -77,11 +77,37 @@ describe("SkillsPane", () => {
     expect(within(card("team-runbook")).getByText("≈200 tokens when on")).toBeDefined();
   });
 
-  it("starts with nothing on, and nothing added to a question", async () => {
+  /**
+   * The skills that ship with the app are why the agent is useful before
+   * anything is set up, so they start on. One the reader installed is theirs to
+   * turn on: installing a file is not agreeing to send it with every question.
+   */
+  it("starts with the preinstalled skills on and the reader's own off, and says what that costs", async () => {
     await shown();
-    expect(toggle("crashloop-triage").getAttribute("aria-checked")).toBe("false");
-    expect(cost()).toBe("≈0");
-    expect(screen.getByText(/from 0 skills that are on/)).toBeDefined();
+    expect(toggle("crashloop-triage").getAttribute("aria-checked")).toBe("true");
+    expect(toggle("pending-pod").getAttribute("aria-checked")).toBe("true");
+    expect(toggle("team-runbook").getAttribute("aria-checked")).toBe("false");
+    expect(cost()).toBe("≈1.5k");
+    expect(screen.getByText(/from 2 skills that are on/)).toBeDefined();
+    expect(screen.getByText(/Preinstalled skills start on; one you install starts off/)).toBeDefined();
+  });
+
+  it("keeps a preinstalled skill off once it is turned off", async () => {
+    await shown();
+    await userEvent.click(toggle("pending-pod"));
+    expect(getSkillDefaults()).toEqual({ on: [], off: ["pending-pod"] });
+    expect(toggle("pending-pod").getAttribute("aria-checked")).toBe("false");
+    expect(setSkillActive).toHaveBeenCalledWith("pending-pod", false);
+    expect(cost()).toBe("≈1k");
+  });
+
+  it("starts a copy that replaces a preinstalled skill on, as the skill it replaces was", async () => {
+    core.listSkills.mockResolvedValue([
+      { ...METAS[0], builtin: false, overridesBuiltin: true, path: `${FOLDER}/crashloop-triage.md` },
+      ...METAS.slice(1),
+    ]);
+    await shown();
+    expect(toggle("crashloop-triage").getAttribute("aria-checked")).toBe("true");
   });
 
   /**
@@ -91,35 +117,36 @@ describe("SkillsPane", () => {
    */
   it("adds up what the skills that are on send with every question", async () => {
     await shown();
-    await userEvent.click(toggle("crashloop-triage"));
-    expect(cost()).toBe("≈1k");
-    expect(screen.getByText(/from 1 skill that is on/)).toBeDefined();
-    await userEvent.click(toggle("pending-pod"));
     expect(cost()).toBe("≈1.5k");
     await userEvent.click(toggle("crashloop-triage"));
     expect(cost()).toBe("≈500");
+    expect(screen.getByText(/from 1 skill that is on/)).toBeDefined();
+    await userEvent.click(toggle("team-runbook"));
+    expect(cost()).toBe("≈700");
+    await userEvent.click(toggle("pending-pod"));
+    expect(cost()).toBe("≈200");
   });
 
   it("keeps a skill that is switched on, and turns it on for this window too", async () => {
     await shown();
-    await userEvent.click(toggle("pending-pod"));
-    expect(getSkillDefaults()).toEqual(["pending-pod"]);
-    expect(toggle("pending-pod").getAttribute("aria-checked")).toBe("true");
-    expect(setSkillActive).toHaveBeenCalledWith("pending-pod", true);
+    await userEvent.click(toggle("team-runbook"));
+    expect(getSkillDefaults()).toEqual({ on: ["team-runbook"], off: [] });
+    expect(toggle("team-runbook").getAttribute("aria-checked")).toBe("true");
+    expect(setSkillActive).toHaveBeenCalledWith("team-runbook", true);
   });
 
   it("opens with the skills kept from before already on", async () => {
     settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(["team-runbook"]));
     await shown();
     expect(toggle("team-runbook").getAttribute("aria-checked")).toBe("true");
-    expect(cost()).toBe("≈200");
+    expect(cost()).toBe("≈1.7k");
   });
 
   it("does not count a kept name whose skill is no longer installed", async () => {
     settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(["deleted-long-ago", "pending-pod"]));
     await shown();
-    expect(cost()).toBe("≈500");
-    expect(screen.getByText(/from 1 skill that is on/)).toBeDefined();
+    expect(cost()).toBe("≈1.5k");
+    expect(screen.getByText(/from 2 skills that are on/)).toBeDefined();
   });
 
   it("lists a skill whose instructions cannot be read, without a size, and says it is not counted", async () => {
@@ -129,8 +156,8 @@ describe("SkillsPane", () => {
     });
     await shown();
     expect(within(card("pending-pod")).getByText("size unknown")).toBeDefined();
-    await userEvent.click(toggle("pending-pod"));
-    expect(cost()).toBe("≈0");
+    // It is on, as a preinstalled skill is, and adds nothing to the figure.
+    expect(cost()).toBe("≈1k");
     expect(screen.getByText("1 skill could not be read and is not counted.")).toBeDefined();
   });
 
@@ -183,7 +210,9 @@ describe("SkillsPane", () => {
     await userEvent.click(within(dialog).getByRole("button", { name: "Uninstall" }));
     await waitFor(() => expect(card("team-runbook")).toBeNull());
     expect(core.deleteSkill).toHaveBeenCalledExactlyOnceWith("team-runbook");
-    expect(getSkillDefaults()).toEqual([]);
+    // Forgotten, not refused: a skill installed later under this name starts
+    // as any new one does.
+    expect(getSkillDefaults()).toEqual({ on: [], off: [] });
     expect(setSkillActive).toHaveBeenCalledWith("team-runbook", false);
   });
 
@@ -284,7 +313,20 @@ describe("SkillsPane", () => {
       await userEvent.click(within(card("crashloop-triage")).getByRole("button", { name: "Restore preinstalled version" }));
       await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Restore" }));
       await waitFor(() => expect(core.deleteSkill).toHaveBeenCalledExactlyOnceWith("crashloop-triage"));
-      expect(getSkillDefaults()).toEqual(["crashloop-triage"]);
+      expect(getSkillDefaults()).toEqual({ on: ["crashloop-triage"], off: [] });
+    });
+
+    it("leaves a skill off when only its copy is removed, if the reader had turned it off", async () => {
+      settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify({ on: [], off: ["crashloop-triage"] }));
+      core.listSkills.mockResolvedValue([
+        { ...METAS[0], builtin: false, overridesBuiltin: true, path: `${FOLDER}/crashloop-triage.md` },
+        ...METAS.slice(1),
+      ]);
+      await shown();
+      await userEvent.click(within(card("crashloop-triage")).getByRole("button", { name: "Restore preinstalled version" }));
+      await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Restore" }));
+      await waitFor(() => expect(core.deleteSkill).toHaveBeenCalledExactlyOnceWith("crashloop-triage"));
+      expect(getSkillDefaults()).toEqual({ on: [], off: ["crashloop-triage"] });
     });
 
     it("says so when the folder could not be opened", async () => {
