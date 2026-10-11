@@ -740,11 +740,14 @@ export function Window({
     // chord's own action, so the sealed rule in `run` covers it too. Classic's
     // fallback comes with it: Close on the last tab closes the window, as
     // macOS does when nothing is left in one. Not under the cover, where the
-    // chord does nothing either.
+    // chord does nothing either. A refused close goes to the console, as
+    // `lockNow`'s refusal does, and for the reason it gives.
     const offMenuClose = desktop
       ? on("close-active-tab", () => {
-          if (!isWorkspaceSealed() && currentWorkspace().tabs.length === 1) void closeCurrentWindow();
-          else runRef.current({ type: "close-tab" });
+          if (isWorkspaceSealed() || currentWorkspace().tabs.length !== 1) return runRef.current({ type: "close-tab" });
+          closeCurrentWindow().catch((error) => {
+            console.error("the window could not be closed:", describeError(error).title, error);
+          });
         })
       : undefined;
     return () => {

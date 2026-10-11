@@ -889,6 +889,24 @@ describe("Window accelerators", () => {
     expect(store.currentWorkspace().tabs).toHaveLength(1);
   });
 
+  it("logs a refused window close rather than leaving it unhandled", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      closeCurrentWindow.mockRejectedValueOnce(new Error("window close not allowed"));
+      await booted();
+      closeFromMenu();
+      await waitFor(() =>
+        expect(logged).toHaveBeenCalledWith(
+          "the window could not be closed:",
+          expect.any(String),
+          expect.objectContaining({ message: "window close not allowed" }),
+        ),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it("leaves the window open when ⌘W reaches the webview on the last tab", async () => {
     await booted();
     fireEvent.keyDown(window, { key: "w", metaKey: true });
