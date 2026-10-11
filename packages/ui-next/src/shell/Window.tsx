@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  checkForUpdateAndNotify,
   cleanErrorMessage,
   describeError,
   isApplePlatform,
@@ -8,6 +9,9 @@ import {
   loadKubeconfigFiles,
   listenForHostNotices,
   loadMcpSettings,
+  loadUpdateChannel,
+  notify,
+  on,
   rehydrateForwards,
   setNotifier,
   startMcpHttp,
@@ -31,6 +35,8 @@ import {
 } from "@srelens/ui-kit";
 import { contextLabelFor } from "../lib/agentSuggestions";
 import {
+  getContexts,
+  getKubeconfigFiles,
   pinContextKey,
   resolveContext,
   setContexts,
@@ -45,6 +51,7 @@ import { getMark, getContextLabel, loadMarks, useMark } from "../lib/marks";
 import { useContextLabel } from "../lib/contextLabel";
 import { mcpAutoStartSettled, mcpAutoStartStarting } from "../lib/mcpAutoStart";
 import { openCluster } from "../lib/openCluster";
+import { openSettings } from "../lib/settingsRequest";
 import { loadPeekWidth } from "../lib/peekWidth";
 import { loadSectionFolds } from "../lib/sectionFolds";
 import { loadExpanded } from "../lib/workspace";
@@ -119,6 +126,9 @@ type Notice = Omit<HostNotice, "level"> & {
 
 /** How long a confirmation stays up: sonner's default, which classic used. */
 const TRANSIENT_NOTICE_MS = 4_000;
+
+/** How often the automatic update check runs after the one at launch: classic's. */
+const UPDATE_CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
 
 export interface WindowProps {
   /** Display names of the screens that exist in the new design. */
@@ -277,6 +287,34 @@ export function Window({
       clusterSignIn: (title, detail, onSignIn) =>
         push({ level: "info", title, detail, action: { label: "Sign in", run: onSignIn } }),
     });
+  }, []);
+  // #374 item 6: classic checks for an update at launch and every six hours
+  // (`App.tsx`), on the channel the reader chose, and offers it in a toast that
+  // opens Settings on Updates. Core's helper swallows a failed check, because a
+  // background poll must not nag, and a version already offered is not offered
+  // again.
+  const offeredVersion = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isTauri()) return;
+    // A check still out when the window goes would answer into whatever sink
+    // `setNotifier` handed back, so its answer is dropped.
+    let live = true;
+    const check = () =>
+      void checkForUpdateAndNotify(
+        loadUpdateChannel(),
+        (update) => {
+          if (!live) return;
+          offeredVersion.current = update.version;
+          notify.updateAvailable(update.version, () => openSettings("updates"));
+        },
+        { alreadyNotified: (version) => offeredVersion.current === version },
+      );
+    check();
+    const timer = setInterval(check, UPDATE_CHECK_EVERY_MS);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
   }, []);
   const notice = notices[0];
   const dismissNotice = () => setNotices((shown) => shown.slice(1));
@@ -531,6 +569,32 @@ export function Window({
     }
   }, [booted, contexts, contextsStatus]);
 
+  // #374 item 3: an edit made outside srelens (`kubectl config use-context`, a
+  // file dropped into the kubeconfig folder) reaches this window only as the
+  // host watcher's `kubeconfig-changed` (`watch_kubeconfig_files`, lib.rs).
+  // Classic re-lists on it. Written the way every Refresh here writes, so a
+  // failed listing keeps the clusters on screen and says why, and whatever
+  // waits on the store — a held deep link, a `?context=` — is judged again.
+  //
+  // Counted, not listed on the spot, so an older listing can never land last.
+  // An edit while boot is still listing waits for boot to install its list,
+  // and each edit drops the reply of the listing before it.
+  const [kubeconfigEdits, setKubeconfigEdits] = useState(0);
+  useEffect(() => {
+    if (!isTauri()) return;
+    return on("kubeconfig-changed", () => setKubeconfigEdits((n) => n + 1));
+  }, []);
+  useEffect(() => {
+    if (!booted || kubeconfigEdits === 0) return;
+    let current = true;
+    void listContexts(getKubeconfigFiles()).then((outcome) => {
+      if (current) setContexts(outcome.contexts ?? getContexts(), outcome.error ?? "");
+    });
+    return () => {
+      current = false;
+    };
+  }, [booted, kubeconfigEdits]);
+
 
   /**
    * Which accelerators survive a raised cover, and why one of them does.
@@ -669,7 +733,17 @@ export function Window({
       runRef.current(action);
     }
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // #374 item 4: on macOS the menu's own Close item takes ⌘W before the
+    // webview sees a keydown (`install_macos_menu`, lib.rs) and says
+    // `close-active-tab` instead, which classic listens for. Here it is the
+    // chord's own action, so the sealed rule in `run` covers it too.
+    const offMenuClose = desktop
+      ? on("close-active-tab", () => runRef.current({ type: "close-tab" }))
+      : undefined;
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      offMenuClose?.();
+    };
   }, [active, apple, desktop]);
 
   /**

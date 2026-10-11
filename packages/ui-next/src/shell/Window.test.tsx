@@ -3,7 +3,7 @@ import { cleanup, render, screen, waitFor, act, within } from "@testing-library/
 import userEvent from "@testing-library/user-event";
 import { fireEvent } from "@testing-library/react";
 import type { HostNotice } from "@srelens/core";
-import { notify, setNotifier } from "@srelens/core";
+import { notify, saveUpdateChannel, setNotifier } from "@srelens/core";
 
 // `vi.hoisted` because `vi.mock` is hoisted above every declaration in the
 // file, and the tabsPersist factory reads these the moment `./Window` imports
@@ -37,6 +37,7 @@ const {
   takePendingDeepLinks,
   subscribeGates,
   getObjectSpy,
+  updateCheck,
   bus,
 } = vi.hoisted(() => ({
   listContexts: vi.fn(),
@@ -78,6 +79,9 @@ const {
   subscribeGates: new Map<string, Promise<void>>(),
   // A spy on the detail screen's read, passed through to the real one.
   getObjectSpy: vi.fn(),
+  // The `update_check` round trip under core's automatic check: the boundary,
+  // so the window's cadence and the core helper's dedupe both run for real.
+  updateCheck: vi.fn<(channel: string) => Promise<{ version: string } | null>>(),
   // The backend event bus, captured per channel so a test can emit exactly
   // what `mcp_confirm.rs` emits.
   //
@@ -111,6 +115,11 @@ vi.mock("@srelens/core", async (importOriginal) => {
     startMcpHttp: (port: number) => startMcpHttp(port),
     respondToConfirm: (id: string, approved: boolean) => respondToConfirm(id, approved),
     pendingConfirms: () => pendingConfirms(),
+    checkForUpdateAndNotify: (...a: Parameters<typeof real.checkForUpdateAndNotify>) =>
+      real.checkForUpdateAndNotify(a[0], a[1], {
+        ...a[2],
+        check: (channel) => updateCheck(channel) as ReturnType<typeof real.checkForUpdate>,
+      }),
     invokeCommand: <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
       command === "take_pending_deep_links"
         ? (takePendingDeepLinks() as Promise<T>)
@@ -301,6 +310,9 @@ beforeEach(() => {
   });
   subscribeGates.clear();
   getObjectSpy.mockReset();
+  // Up to date unless a test says otherwise: an update toast would otherwise
+  // sit in front of every notice another test asserts on.
+  updateCheck.mockReset().mockResolvedValue(null);
   bus.clear();
   resetLock();
   resetMcpAutoStart();
@@ -316,6 +328,13 @@ beforeEach(() => {
   resetView();
   resetContexts();
 });
+
+/** What `install_macos_menu` (lib.rs) emits when the menu's Close takes ⌘W. */
+function closeFromMenu() {
+  act(() => {
+    for (const handler of bus.get("close-active-tab") ?? []) handler(null);
+  });
+}
 
 async function booted() {
   render(
@@ -844,6 +863,42 @@ describe("Window accelerators", () => {
     expect(store.currentWorkspace().tabs).toHaveLength(2);
   });
 
+  /**
+   * #374 item 4: on macOS the menu's own Close item owns ⌘W
+   * (`install_macos_menu`, lib.rs), so the webview never sees the keydown; the
+   * host says `close-active-tab` instead, as classic listens for.
+   */
+  it("closes the active tab when the macOS menu's Close says so, as ⌘W does", async () => {
+    await booted();
+    act(() => store.openTab("/k/pods"));
+    closeFromMenu();
+    expect(store.currentWorkspace().tabs.map((t) => t.route)).toEqual(["/"]);
+    expect(store.currentWorkspace().closed).toHaveLength(1);
+  });
+
+  it("stops hearing the menu's Close when the window goes", async () => {
+    await booted();
+    expect(bus.get("close-active-tab")?.size).toBe(1);
+    cleanup();
+    expect(bus.get("close-active-tab")?.size ?? 0).toBe(0);
+  });
+
+  it("does not hear the menu's Close while inactive, as ⌘W is not heard", async () => {
+    render(
+      <ConsoleProvider>
+        <Window ported={[]} onOpenInClassic={() => {}} active={false} />
+      </ConsoleProvider>,
+    );
+    await screen.findByRole("heading", { level: 1, name: "Home" });
+    expect(bus.get("close-active-tab")?.size ?? 0).toBe(0);
+  });
+
+  it("does not listen for the menu's Close in a browser, which has no such menu", async () => {
+    isTauri.mockReturnValue(false);
+    await booted();
+    expect(bus.get("close-active-tab")?.size ?? 0).toBe(0);
+  });
+
   it("binds nothing while inactive, and takes the chrome down but not the bodies", async () => {
     render(
       <ConsoleProvider>
@@ -1010,6 +1065,91 @@ describe("Window contexts", () => {
   it("passes the configured kubeconfig files to listContexts", async () => {
     await booted();
     expect(listContexts).toHaveBeenCalledWith(["/home/u/.kube/config", "/home/u/.kube/other"]);
+  });
+});
+
+/**
+ * #374 item 3: an edit made outside srelens — `kubectl config use-context`, a
+ * file dropped into the kubeconfig folder — reaches the window only as the
+ * host watcher's `kubeconfig-changed` (`lib.rs`). Classic re-lists on it; this
+ * window kept its boot listing until a reader pressed Refresh.
+ */
+describe("Window — an outside kubeconfig edit", () => {
+  function kubeconfigChanged() {
+    act(() => {
+      for (const handler of bus.get("kubeconfig-changed") ?? []) handler(null);
+    });
+  }
+
+  it("lists the contexts again, with the configured files, when the host says the kubeconfig changed", async () => {
+    await booted();
+    listContexts.mockClear().mockResolvedValue({ contexts: [ctx("prod"), ctx("dev")] });
+    kubeconfigChanged();
+    await waitFor(() => expect(contextFor("dev")?.name).toBe("dev"));
+    expect(listContexts).toHaveBeenCalledWith(["/home/u/.kube/config", "/home/u/.kube/other"]);
+  });
+
+  it("keeps the clusters it has when that listing fails, and says why", async () => {
+    await booted();
+    listContexts.mockResolvedValue({ error: "kubeconfig unreadable" });
+    kubeconfigChanged();
+    await waitFor(() => expect(getContextsStatus()).toBe("failed"));
+    expect(getContextsError()).toBe("kubeconfig unreadable");
+    expect(contextFor("prod")?.name).toBe("prod");
+  });
+
+  it("keeps the newer listing when an older one answers after it", async () => {
+    await booted();
+    // Each listing answers only when told to, with the file as it stood when
+    // that listing began.
+    const file = { contexts: [ctx("prod"), ctx("dev")] };
+    const answers: Array<() => void> = [];
+    listContexts.mockImplementation(() => {
+      const seen = file.contexts;
+      return new Promise((resolve) => answers.push(() => resolve({ contexts: seen })));
+    });
+    kubeconfigChanged();
+    await waitFor(() => expect(answers).toHaveLength(1));
+    file.contexts = [ctx("prod"), ctx("dev"), ctx("stage")];
+    kubeconfigChanged();
+    await waitFor(() => expect(answers).toHaveLength(2));
+    await act(async () => answers[1]());
+    await act(async () => answers[0]());
+    expect(contextFor("stage")?.name).toBe("stage");
+  });
+
+  it("lists again once boot is done when the kubeconfig changed while boot was listing", async () => {
+    let answerBoot!: () => void;
+    listContexts.mockImplementationOnce(
+      () => new Promise((resolve) => (answerBoot = () => resolve({ contexts: [ctx("prod")] }))),
+    );
+    // The file after the edit.
+    listContexts.mockResolvedValue({ contexts: [ctx("prod"), ctx("dev")] });
+    render(
+      <ConsoleProvider>
+        <Window ported={[]} onOpenInClassic={() => {}} />
+      </ConsoleProvider>,
+    );
+    await waitFor(() => expect(listContexts).toHaveBeenCalledTimes(1));
+    kubeconfigChanged();
+    await act(async () => answerBoot());
+    await waitFor(() => expect(screen.getByRole("tablist", { name: "Open tabs" })).toBeDefined());
+    await waitFor(() => expect(contextFor("dev")?.name).toBe("dev"));
+    // Boot's listing and one for the edit: none started under boot's feet.
+    expect(listContexts).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops listening when the window goes", async () => {
+    await booted();
+    expect(bus.get("kubeconfig-changed")?.size).toBe(1);
+    cleanup();
+    expect(bus.get("kubeconfig-changed")?.size ?? 0).toBe(0);
+  });
+
+  it("does not listen in a browser, where no host watches a kubeconfig", async () => {
+    isTauri.mockReturnValue(false);
+    await booted();
+    expect(bus.get("kubeconfig-changed")?.size ?? 0).toBe(0);
   });
 });
 
@@ -1222,6 +1362,90 @@ describe("Window — notify toasts (#374)", () => {
 });
 
 /**
+ * #374 item 6: classic checks for an update at launch and every six hours
+ * (`App.tsx`) and offers it in a toast that opens Settings on Updates. This
+ * window checked only when a reader opened Release notes and asked.
+ */
+describe("Window — the automatic update check", () => {
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+  const UPDATE = { version: "0.99.0", currentVersion: "0.98.0", notes: "", external: false, elevates: false };
+
+  it("checks the saved channel at launch, and offers what it finds on Settings' Updates", async () => {
+    saveUpdateChannel("dev");
+    updateCheck.mockResolvedValue(UPDATE);
+    const user = userEvent.setup();
+    await booted();
+    expect(await screen.findByText(/srelens 0\.99\.0 is ready to install/)).toBeDefined();
+    expect(updateCheck).toHaveBeenCalledWith("dev");
+    await user.click(screen.getByRole("button", { name: "View update" }));
+    expect(store.activeRoute()).toBe("/settings");
+    expect(await screen.findByRole("tab", { name: "Updates", selected: true })).toBeDefined();
+  });
+
+  it("checks again every six hours, and does not offer a version it already offered", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      updateCheck.mockResolvedValue(UPDATE);
+      await booted();
+      await screen.findByText("Update available");
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+
+      await act(async () => vi.advanceTimersByTime(SIX_HOURS - 60_000));
+      expect(updateCheck).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTime(60_000));
+      expect(updateCheck).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await updateCheck.mock.results[1].value;
+      });
+      expect(screen.queryByText("Update available")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops checking when the window goes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await booted();
+      await waitFor(() => expect(updateCheck).toHaveBeenCalledTimes(1));
+      cleanup();
+      act(() => vi.advanceTimersByTime(SIX_HOURS));
+      expect(updateCheck).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers nothing once the window has gone, when the check answers late", async () => {
+    let answer!: (update: typeof UPDATE) => void;
+    updateCheck.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    const replaced = {
+      success: vi.fn(),
+      info: vi.fn(),
+      error: vi.fn(),
+      updateAvailable: vi.fn(),
+      clusterSignIn: vi.fn(),
+    };
+    const restore = setNotifier(replaced);
+    try {
+      await booted();
+      await waitFor(() => expect(updateCheck).toHaveBeenCalledTimes(1));
+      cleanup();
+      await act(async () => answer(UPDATE));
+      expect(replaced.updateAvailable).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not check in a browser, which has no updater", async () => {
+    isTauri.mockReturnValue(false);
+    await booted();
+    expect(updateCheck).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * §25's cover, proved against the real chrome rather than against a tile.
  *
  * The tab strip and the cluster rail are what PR #365 deliberately made
@@ -1340,6 +1564,16 @@ describe("Window — what the cover has to take with it", () => {
     fireEvent.keyDown(window, { key: "]", metaKey: true, shiftKey: true });
     fireEvent.keyDown(window, { key: "1", metaKey: true });
     expect(store.currentWorkspace().activeId).toBe(activeBefore);
+  });
+
+  it("closes no tab from the macOS menu's Close while the cover is up", async () => {
+    await sealed();
+    // Positive control: the menu's Close is heard here, or its doing nothing
+    // below would prove nothing.
+    expect(bus.get("close-active-tab")?.size).toBe(1);
+    closeFromMenu();
+    closeFromMenu();
+    expect(store.currentWorkspace().tabs).toHaveLength(2);
   });
 
   /**
@@ -2178,6 +2412,25 @@ describe("Window — srelens:// deep links", () => {
     act(() => setContexts([ctx("prod")], "open /home/dana/.kube/stage: permission denied"));
     await deliver("srelens://cluster/stage");
     expect(shownNotice() ?? "").toContain("That link will be checked once the contexts load");
+  });
+
+  it("opens a link held behind a failed listing once an outside edit fixes the kubeconfig", async () => {
+    listContexts.mockResolvedValue({
+      contexts: [ctx("prod")],
+      error: "open /home/dana/.kube/stage: permission denied",
+    });
+    await booted();
+    await deliver("srelens://cluster/stage");
+    expect(store.activeCluster()).not.toBe("stage");
+
+    // The reader fixes the file in a terminal; the host's watcher says so, and
+    // nobody has to find a Refresh button for the link they already clicked.
+    listContexts.mockResolvedValue({ contexts: [ctx("prod"), ctx("stage")] });
+    act(() => {
+      for (const handler of bus.get("kubeconfig-changed") ?? []) handler(null);
+    });
+    await waitFor(() => expect(store.activeCluster()).toBe("stage"));
+    expect(store.activeRoute()).toBe("/overview");
   });
 
   it("still refuses at once, while the listing has failed, what no listing can change", async () => {
