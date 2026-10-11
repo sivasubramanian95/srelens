@@ -108,7 +108,7 @@ import { AgentConsent } from "./AgentConsent";
 import { Body } from "./Body";
 import { Chrome, zoom } from "./Chrome";
 import { Console } from "./Console";
-import { isWorkspaceSealed, LockGate, lockWorkspace } from "./LockGate";
+import { isWorkspaceSealed, LockGate, lockWorkspace, useWorkspaceSealed } from "./LockGate";
 import { Nav } from "./Nav";
 import { Rail } from "./Rail";
 import { Status } from "./Status";
@@ -319,6 +319,11 @@ export function Window({
   }, []);
   const notice = notices[0];
   const dismissNotice = () => setNotices((shown) => shown.slice(1));
+  // The queue is drawn outside `LockGate`, so a notice stays in view over the
+  // cover, but its action ("View update", "Sign in") opens a tab: held while
+  // the cover is up, like every other act on the workspace (see `run`).
+  // Subscribed, not read at render, so it comes back on unlock.
+  const sealed = useWorkspaceSealed();
   // A confirmation goes on its own, the way classic's did; a failure or a
   // prompt waits for the reader.
   useEffect(() => {
@@ -1100,6 +1105,8 @@ export function Window({
                 type="button"
                 size="sm"
                 className="mt-1.5 block"
+                disabled={sealed}
+                title={sealed ? "Unlock the workspace first" : undefined}
                 onClick={() => {
                   dismissNotice();
                   notice.action?.run();

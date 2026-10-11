@@ -1667,6 +1667,50 @@ describe("Window — what the cover has to take with it", () => {
   });
 
   /**
+   * The notice queue is drawn outside `LockGate`, so a notice stays in view
+   * over the cover — the reader still learns an update exists. Its action is
+   * another matter: "View update" opens Settings, and a tab opened behind the
+   * cover is the same workspace change the chords above are refused.
+   */
+  describe("a notice's action", () => {
+    const UPDATE = { version: "0.99.0", currentVersion: "0.98.0", notes: "", external: false, elevates: false };
+    const viewUpdate = () => screen.getByRole("button", { name: "View update" }) as HTMLButtonElement;
+
+    beforeEach(() => {
+      updateCheck.mockResolvedValue(UPDATE);
+    });
+
+    it("stays in view but is held while the cover is up", async () => {
+      await sealed();
+      await screen.findByText("Update available");
+      await userEvent.click(viewUpdate());
+      expect(store.currentWorkspace().tabs.some((t) => t.route === "/settings")).toBe(false);
+      expect(viewUpdate().disabled).toBe(true);
+      expect(screen.getByText("Update available")).toBeTruthy();
+    });
+
+    it("is given back once the vault opens again, without a reload", async () => {
+      await sealed();
+      await screen.findByText("Update available");
+      expect(viewUpdate().disabled).toBe(true);
+      vaultStatus.mockResolvedValue(VAULT_OPEN);
+      await userEvent.type(screen.getByLabelText("Master passphrase"), "aaaa1111aaaa");
+      await userEvent.click(screen.getByRole("button", { name: "Unlock workspace" }));
+      await screen.findByRole("tablist");
+      expect(viewUpdate().disabled).toBe(false);
+      await userEvent.click(viewUpdate());
+      expect(store.activeRoute()).toBe("/settings");
+    });
+
+    it("leaves the notice dismissable while the cover is up", async () => {
+      await sealed();
+      await screen.findByText("Update available");
+      await userEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+      expect(screen.queryByText("Update available")).toBeNull();
+    });
+  });
+
+  /**
    * The titlebar's `Lock workspace` control, through the real window: it must
    * reach `lockNow` — the same function `⌘⇧L` fires — and not a second lock path
    * of its own.
