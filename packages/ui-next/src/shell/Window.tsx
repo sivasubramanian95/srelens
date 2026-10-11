@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   checkForUpdateAndNotify,
   cleanErrorMessage,
+  closeCurrentWindow,
   describeError,
   isApplePlatform,
   isTauri,
@@ -736,9 +737,15 @@ export function Window({
     // #374 item 4: on macOS the menu's own Close item takes ⌘W before the
     // webview sees a keydown (`install_macos_menu`, lib.rs) and says
     // `close-active-tab` instead, which classic listens for. Here it is the
-    // chord's own action, so the sealed rule in `run` covers it too.
+    // chord's own action, so the sealed rule in `run` covers it too. Classic's
+    // fallback comes with it: Close on the last tab closes the window, as
+    // macOS does when nothing is left in one. Not under the cover, where the
+    // chord does nothing either.
     const offMenuClose = desktop
-      ? on("close-active-tab", () => runRef.current({ type: "close-tab" }))
+      ? on("close-active-tab", () => {
+          if (!isWorkspaceSealed() && currentWorkspace().tabs.length === 1) void closeCurrentWindow();
+          else runRef.current({ type: "close-tab" });
+        })
       : undefined;
     return () => {
       window.removeEventListener("keydown", onKey);
