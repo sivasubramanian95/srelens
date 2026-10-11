@@ -85,6 +85,32 @@ async function latest(): Promise<readonly string[]> {
 /** Saves run one after another, each on top of what the one before it kept. */
 let saving: Promise<void> = Promise.resolve();
 
+/** A switch thrown and not yet kept. */
+interface Change {
+  name: string;
+  on: boolean;
+}
+
+/** The switches thrown and not yet kept, oldest first. */
+let waiting: Change[] = [];
+
+function changed(list: readonly string[], { name, on }: Change): readonly string[] {
+  if (list.includes(name) === on) return list;
+  return on ? [...list, name] : list.filter((n) => n !== name);
+}
+
+/**
+ * Show `kept` with every switch still waiting to be kept thrown on top of it.
+ * A save or a re-read that finishes while later clicks are waiting must not
+ * show the list as it was before them: the switch would flip back under the
+ * reader's hand, and since it decides what a click means from what it shows,
+ * the next click would keep the opposite of what they meant.
+ */
+function show(kept: readonly string[]): void {
+  defaults = waiting.reduce(changed, kept);
+  notify();
+}
+
 /**
  * Turn a skill on or off for every new conversation — and for this window's
  * next question too, so the switch does what it says without a restart.
@@ -95,16 +121,15 @@ let saving: Promise<void> = Promise.resolve();
  * copy would silently turn that one off again.
  */
 export function setSkillDefault(name: string, on: boolean): void {
-  const toggled = (list: readonly string[]) =>
-    list.includes(name) === on ? list : on ? [...list, name] : list.filter((n) => n !== name);
   if (read().includes(name) === on) return;
-  defaults = toggled(read());
+  const change: Change = { name, on };
+  waiting.push(change);
+  defaults = changed(read(), change);
   setSkillActive(name, on);
   notify();
   saving = saving.then(async () => {
     const kept = await latest();
-    const next = toggled(kept);
-    defaults = next;
+    const next = changed(kept, change);
     if (next !== kept) {
       try {
         settingsStorage.setItem(SKILL_DEFAULTS_KEY, JSON.stringify(next));
@@ -112,7 +137,8 @@ export function setSkillDefault(name: string, on: boolean): void {
         // Storage is unavailable: the choice holds for this session.
       }
     }
-    notify();
+    waiting = waiting.filter((c) => c !== change);
+    show(next);
   });
 }
 
@@ -122,10 +148,7 @@ export function setSkillDefault(name: string, on: boolean): void {
  * conversations does not move: that is this window's until it is restarted.
  */
 export function refreshSkillDefaults(): Promise<void> {
-  saving = saving.then(async () => {
-    defaults = await latest();
-    notify();
-  });
+  saving = saving.then(async () => show(await latest()));
   return saving;
 }
 
@@ -163,5 +186,6 @@ export function formatTokens(n: number): string {
 export function __resetSkillDefaultsForTests(): void {
   defaults = null;
   saving = Promise.resolve();
+  waiting = [];
   listeners.clear();
 }
