@@ -38,6 +38,7 @@ const {
   subscribeGates,
   getObjectSpy,
   updateCheck,
+  closeCurrentWindow,
   bus,
 } = vi.hoisted(() => ({
   listContexts: vi.fn(),
@@ -82,6 +83,7 @@ const {
   // The `update_check` round trip under core's automatic check: the boundary,
   // so the window's cadence and the core helper's dedupe both run for real.
   updateCheck: vi.fn<(channel: string) => Promise<{ version: string } | null>>(),
+  closeCurrentWindow: vi.fn<() => Promise<void>>(async () => {}),
   // The backend event bus, captured per channel so a test can emit exactly
   // what `mcp_confirm.rs` emits.
   //
@@ -107,6 +109,7 @@ vi.mock("@srelens/core", async (importOriginal) => {
     subscribeForwards: (...a: Parameters<typeof subscribeForwards>) => subscribeForwards(...a),
     isApplePlatform: () => isApplePlatform(),
     isTauri: () => isTauri(),
+    closeCurrentWindow: () => closeCurrentWindow(),
     loadKubeconfigFiles: () => loadKubeconfigFiles(),
     vaultStatus: () => vaultStatus(),
     vaultLock: () => vaultLock(),
@@ -313,6 +316,7 @@ beforeEach(() => {
   // Up to date unless a test says otherwise: an update toast would otherwise
   // sit in front of every notice another test asserts on.
   updateCheck.mockReset().mockResolvedValue(null);
+  closeCurrentWindow.mockClear();
   bus.clear();
   resetLock();
   resetMcpAutoStart();
@@ -874,6 +878,39 @@ describe("Window accelerators", () => {
     closeFromMenu();
     expect(store.currentWorkspace().tabs.map((t) => t.route)).toEqual(["/"]);
     expect(store.currentWorkspace().closed).toHaveLength(1);
+    expect(closeCurrentWindow).not.toHaveBeenCalled();
+  });
+
+  it("closes the window when the menu's Close lands on the last tab, as classic does", async () => {
+    await booted();
+    expect(store.currentWorkspace().tabs).toHaveLength(1);
+    closeFromMenu();
+    expect(closeCurrentWindow).toHaveBeenCalledTimes(1);
+    expect(store.currentWorkspace().tabs).toHaveLength(1);
+  });
+
+  it("logs a refused window close rather than leaving it unhandled", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      closeCurrentWindow.mockRejectedValueOnce(new Error("window close not allowed"));
+      await booted();
+      closeFromMenu();
+      await waitFor(() =>
+        expect(logged).toHaveBeenCalledWith(
+          "the window could not be closed:",
+          expect.any(String),
+          expect.objectContaining({ message: "window close not allowed" }),
+        ),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("leaves the window open when ⌘W reaches the webview on the last tab", async () => {
+    await booted();
+    fireEvent.keyDown(window, { key: "w", metaKey: true });
+    expect(closeCurrentWindow).not.toHaveBeenCalled();
   });
 
   it("stops hearing the menu's Close when the window goes", async () => {
@@ -1574,6 +1611,15 @@ describe("Window — what the cover has to take with it", () => {
     closeFromMenu();
     closeFromMenu();
     expect(store.currentWorkspace().tabs).toHaveLength(2);
+  });
+
+  it("closes no window from the macOS menu's Close on the last tab while the cover is up", async () => {
+    await booted();
+    fireEvent.keyDown(window, { key: "L", metaKey: true, shiftKey: true });
+    await screen.findByText("Workspace locked");
+    expect(store.currentWorkspace().tabs).toHaveLength(1);
+    closeFromMenu();
+    expect(closeCurrentWindow).not.toHaveBeenCalled();
   });
 
   /**
