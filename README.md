@@ -240,6 +240,15 @@ Or download `srectl-<version>-<target>.tar.gz` (or `.zip` on Windows) from the
 release, for Linux (glibc and static musl) and macOS on x86-64 and arm64, and
 for Windows on x86-64. macOS builds on a stable release are signed and notarized.
 
+Nix, from this repository — `srectl` is the default package, and the same flake
+builds the desktop app (`#srelens`) and the web server (`#srelens-server`):
+
+```bash
+nix profile install github:srelens/srelens#srectl
+```
+
+Nix owns that copy, so `srectl update` declines. The [installation guide](docs/INSTALL.md) has the other two packages and `nix profile upgrade`.
+
 ### Web app (Docker)
 
 srelens also runs as a multi-user web server in a container. Users sign in with

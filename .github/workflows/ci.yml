@@ -86,6 +86,11 @@ jobs:
         # copies, so its links need a prefix the English text does not (#865).
         # Nothing builds these files; a dead image only shows on GitHub.
         run: node --test scripts/docs/readme.test.mjs
+      - name: Nix flake contract
+        # The install commands in docs/INSTALL.md, the pnpm major, and a hash
+        # for every git crate importCargoLock has to vendor. No Nix install
+        # and no build — those are what `nix build` is for.
+        run: node --test packaging/nix/flake.test.mjs
 
   backend:
     name: backend
