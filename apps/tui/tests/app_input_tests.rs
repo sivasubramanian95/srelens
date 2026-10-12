@@ -6580,50 +6580,53 @@ async fn argo_view_column_prioritization_and_no_clipping() {
     );
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Renders the argo view, asserts its header shows `[{prefix}as of <age> ago]`
+/// and returns the text. The view reads the wall clock itself, so an exact age
+/// races the clock (#895): accept every age between the clock reads either
+/// side of the render.
+fn assert_argo_age_tag(state: &srectl::views::argo_view::ArgoViewState, prefix: &str) -> String {
+    let fetched_at = state.fetched_at.expect("fetched_at is set");
+    let before = unix_now();
+    let text = common::render_text(160, 25, |f| {
+        srectl::views::argo_view::render_argo_view(f, f.area(), state);
+    });
+    let ages: Vec<String> = (before..=unix_now())
+        .map(|now| srelens_kube::format_age(now.saturating_sub(fetched_at) as i64))
+        .collect();
+    assert!(
+        ages.iter()
+            .any(|age| text.contains(&format!("[{prefix}as of {age} ago]"))),
+        "header must show [{prefix}as of {ages:?} ago], got:\n{text}"
+    );
+    text
+}
+
 #[tokio::test]
 async fn argo_view_renders_header_with_age_tag_and_hub_spoke_filtering() {
     let mut argo_state = srectl::views::argo_view::ArgoViewState::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    argo_state.fetched_at = Some(now - 30); // 30s ago
+    argo_state.fetched_at = Some(unix_now() - 30); // 30s ago
 
     // 1. Remote hub with spoke filter
     argo_state.set_applications(vec![], vec![], true, Some("tools".to_string()));
-    let text = common::render_text(160, 25, |f| {
-        srectl::views::argo_view::render_argo_view(f, f.area(), &argo_state);
-    });
-    assert!(
-        text.contains("[Hub: tools · Spoke Filtered, as of 30s ago]"),
-        "must render spoke filtered age tag in header, got:\n{}",
-        text
-    );
+    let text = assert_argo_age_tag(&argo_state, "Hub: tools · Spoke Filtered, ");
     assert!(!text.contains("View All Hub Apps"));
     assert!(!text.contains("Hard refresh"));
 
     // 2. Remote hub with all hub apps
     argo_state.show_all_hub_apps = true;
-    let text_all = common::render_text(160, 25, |f| {
-        srectl::views::argo_view::render_argo_view(f, f.area(), &argo_state);
-    });
-    assert!(
-        text_all.contains("[Hub: tools · All Hub Apps, as of 30s ago]"),
-        "must render all hub apps age tag in header, got:\n{}",
-        text_all
-    );
+    assert_argo_age_tag(&argo_state, "Hub: tools · All Hub Apps, ");
 
-    // 3. Local argo cluster (not remote hub)
+    // 3. Local argo cluster (not remote hub): no Hub: prefix
     argo_state.is_remote_hub = false;
     argo_state.hub_context_name = None;
-    let text_local = common::render_text(160, 25, |f| {
-        srectl::views::argo_view::render_argo_view(f, f.area(), &argo_state);
-    });
-    assert!(
-        text_local.contains("[as of 30s ago]"),
-        "must render local age tag without Hub: prefix, got:\n{}",
-        text_local
-    );
+    assert_argo_age_tag(&argo_state, "");
 }
 
 #[tokio::test]
