@@ -8,6 +8,7 @@ import { ConsoleProvider } from "../console";
 import { lockWorkspace, resetLock } from "../shell/LockGate";
 import { screenFor } from "../lib/routes";
 import { Home } from "./Home";
+import { clearResourceCache } from "../lib/cachedResource";
 import { resetContexts, setContexts } from "../lib/clusters";
 import { loadRecentLogSubjects, rememberLogSubject } from "../lib/logRecents";
 import { defaultMark, loadMarks, setMark } from "../lib/marks";
@@ -39,7 +40,7 @@ beforeEach(() => {
   reads.listDaemonSets.mockReset().mockResolvedValue({ daemonsets: [] });
   reads.listEvents.mockReset().mockResolvedValue({ events: [] });
   reads.listResource.mockReset().mockResolvedValue({ items: [] });
-  localStorage.clear(); loadMarks(); resetContexts(); resetView(); resetLock(); loadRecentLogSubjects();
+  localStorage.clear(); loadMarks(); resetContexts(); resetView(); resetLock(); loadRecentLogSubjects(); clearResourceCache();
   setState(defaultState([]));
 });
 afterEach(() => vi.restoreAllMocks());
@@ -59,6 +60,7 @@ describe("Home", () => {
     render(<Home />);
     expect(screen.getByRole("heading", { name: "Home", level: 1 })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Clusters", level: 2 })).toBeTruthy();
+    expect(screen.getByText("What needs you, what is running, and where you left off.")).toBeTruthy();
     expect(screen.getByText("No clusters configured")).toBeTruthy();
     expect(screen.queryByText(/not in the new design/)).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Connect a cluster" }));
