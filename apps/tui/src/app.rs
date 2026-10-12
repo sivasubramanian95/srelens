@@ -355,7 +355,27 @@ pub fn normalize_line_breaks(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// The command a `$BROWSER` value runs on `url`, shell-split like `$EDITOR`.
+/// `None` when the value names no program.
+pub fn browser_env_command(browser: &str, url: &str) -> Option<std::process::Command> {
+    let parts: Vec<String> = shlex::split(browser)
+        .unwrap_or_else(|| browser.split_whitespace().map(String::from).collect());
+    let (prog, args) = parts.split_first()?;
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args).arg(url);
+    Some(cmd)
+}
+
+/// Opens `url` with `$BROWSER` when it is set, else with the platform's opener.
 pub fn open_browser_url(url: &str) -> Result<(), String> {
+    if let Ok(browser) = std::env::var("BROWSER") {
+        if let Some(mut cmd) = browser_env_command(&browser, url) {
+            return cmd
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to open {url} with '{browser}': {e}"));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")

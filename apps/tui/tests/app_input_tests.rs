@@ -6629,6 +6629,39 @@ async fn argo_view_renders_header_with_age_tag_and_hub_spoke_filtering() {
     assert_argo_age_tag(&argo_state, "");
 }
 
+#[test]
+fn open_browser_url_runs_the_browser_env_command_on_the_url() {
+    // $BROWSER names a program that cannot exist, so the spawn fails and no
+    // browser opens. The quoted form also exercises the shlex split.
+    let mut env = common::env::lock();
+    env.set("BROWSER", "\"srelens-no-such-browser-0x380\" --new-tab");
+    let result = srectl::app::open_browser_url("https://example.invalid/srelens-896");
+    drop(env);
+    let err = result.expect_err("a nonexistent browser cannot be spawned");
+    assert!(
+        err.starts_with(
+            "Failed to open https://example.invalid/srelens-896 with \
+             '\"srelens-no-such-browser-0x380\" --new-tab':"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn browser_env_command_passes_the_options_then_the_url() {
+    // Built, never spawned: the program, its options and the URL arrive as
+    // separate arguments.
+    let cmd = srectl::app::browser_env_command(
+        "\"srelens-no-such-browser-0x380\" --new-tab",
+        "https://example.invalid/srelens-896",
+    )
+    .expect("a non-empty $BROWSER is a command");
+    assert_eq!(cmd.get_program(), "srelens-no-such-browser-0x380");
+    let args: Vec<_> = cmd.get_args().collect();
+    assert_eq!(args, ["--new-tab", "https://example.invalid/srelens-896"]);
+    assert!(srectl::app::browser_env_command("  ", "https://example.invalid").is_none());
+}
+
 #[tokio::test]
 async fn argo_view_key_bindings_and_actions() {
     let _settings = common::env::isolate_settings();
@@ -6730,9 +6763,14 @@ async fn argo_view_key_bindings_and_actions() {
     press(&mut app, ch('r')).await;
     assert!(toast(&app).contains("Refreshing ArgoCD applications"));
 
-    // 8. Open Git repo ('g') - app1 has repo_url configured
+    // 8. Open Git repo ('g') - app1 has repo_url configured. The settings
+    // guard's $BROWSER cannot exist, so the repo is tried but never opened.
     press(&mut app, ch('g')).await;
-    assert!(toast(&app).contains("Git repo") || toast(&app).contains("Could not open browser"));
+    let want = format!(
+        "Could not open browser: Failed to open https://github.com/example/repo with '{}':",
+        common::env::NO_BROWSER
+    );
+    assert!(toast(&app).starts_with(&want), "{}", toast(&app));
 
     // 9. Config view ('c')
     press(&mut app, ch('c')).await;
@@ -6900,7 +6938,11 @@ async fn argo_detail_view_key_navigation_and_actions() {
     assert!(toast(&app).contains("Copied deep link"));
 
     press(&mut app, ch('g')).await;
-    assert!(toast(&app).contains("Git repo") || toast(&app).contains("Could not open browser"));
+    let want = format!(
+        "Could not open browser: Failed to open https://github.com/example/payments with '{}':",
+        common::env::NO_BROWSER
+    );
+    assert!(toast(&app).starts_with(&want), "{}", toast(&app));
 
     // 4. Exit detail view via 'q'
     press(&mut app, ch('q')).await;
