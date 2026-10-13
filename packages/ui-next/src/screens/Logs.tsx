@@ -58,6 +58,7 @@ import { useActiveContext } from "../lib/clusters";
 import { FailureAlert, FailureState } from "../lib/errorCopy";
 import { Icons } from "../lib/icons";
 import { useLogStream, type LogStreamStatus } from "../lib/logStream";
+import { useThrottledValue } from "../lib/useThrottledValue";
 import { groupNumber } from "../lib/numbers";
 import { saveOrDownload } from "../lib/saveOrDownload";
 import {
@@ -189,6 +190,12 @@ function providerKind(kind: string): string | undefined {
 /** How near the bottom still counts as being at it, in pixels. Classic's 48. */
 const STICK_SLACK = 48;
 
+/** How often, at most, a busy stream's lines reach the counts: four times a second. */
+const RECOUNT_MS = 250;
+
+/** How long the view must be held before the filter bar says so: longer than a click's press. */
+const HELD_NOTE_MS = 300;
+
 /**
  * The one state this readout can be in that the CONNECTION is not.
  *
@@ -273,6 +280,12 @@ const NO_CLAUSES: readonly QueryClause[] = [];
 
 /** One line as the body draws it: the four columns, plus what a filter reads. */
 interface Row extends QueryLine {
+  /**
+   * Which row this is, for as long as its line is in the buffer: the key it is drawn under. Nothing in a line can be
+   * (two identical lines a second apart are ordinary), and its place cannot: a full ring moves every line up each
+   * batch, and a row keyed by its place hands its element to the next line, under the reader's pointer or selection.
+   */
+  readonly id: number;
   /**
    * The line's instant on the reader's clock, `HH:MM:SS.mmm`, or `""` for a
    * line without a parseable stamp. Derived from `at`, so the two cannot
@@ -363,7 +376,7 @@ function indexTargets(targets: readonly LogTarget[]): ReadonlyMap<string, LogTar
  * line the screen did not ask for; naming it from its own string beats drawing
  * it nameless.
  */
-function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>): Row {
+function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>, id: number): Row {
   const stamp = line.text.match(RFC3339);
   const at = stamp ? stampTime(stamp) : undefined;
   // The reader's clock, like the histogram's axis and the window pill beside
@@ -388,6 +401,7 @@ function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>): Row {
   const health = logLineHealth(text);
   const parsed = parseLogFields(text);
   return {
+    id,
     ts,
     pod,
     container,
@@ -847,6 +861,76 @@ function LogsStream({
   });
   // Home's "Live now" lists this tab only while the stream is actually running.
   useMarkLogStream(useTabScope(), stream.status !== "error" && stream.status !== "completed");
+  // A provider's stream that ended sends no more statuses, so the hook's last one
+  // would go on saying it follows: the ending is what the readout says instead.
+  const ended = chosen ? provider.end : null;
+  /** Whether new lines are arriving in THIS pane. A snapshot is not followed,
+   *  however healthy the connection underneath it is. */
+  const following = !previous && !stream.paused && !ended;
+
+  /**
+   * Hold the view while the reader works in it: from a press in the log to its release, and while a selection lies
+   * in it. A following view moves every frame, so a press and its release land on different lines, which is no
+   * click, and the text under a selection is rewritten before it can be copied. The reader's Pause is theirs and
+   * is left alone; see the hook's `hold`.
+   */
+  const pressedRef = useRef(false);
+  const selectingRef = useRef(false);
+  const { hold } = stream;
+  const syncHold = useCallback(() => hold(pressedRef.current || selectingRef.current), [hold]);
+  useEffect(() => {
+    const onSelection = () => {
+      const selection = document.getSelection();
+      const viewport = viewportRef.current;
+      selectingRef.current =
+        selection !== null &&
+        !selection.isCollapsed &&
+        viewport !== null &&
+        (viewport.contains(selection.anchorNode) || viewport.contains(selection.focusNode));
+      syncHold();
+    };
+    // Anywhere on the window: a drag that started in the log can end anywhere, and a press the browser takes back,
+    // or whose release never reaches the page (the window loses focus or is hidden), must not leave the view held.
+    // Let go a task later, after the click a release makes: let go at once, the lines that waited move the view
+    // first, and the pressed row is gone. A selection is not let go of here; only collapsing or leaving the log does.
+    // A release is heard on its way down, so nothing on the page that stops it on its way up keeps it from the
+    // window. Not `blur`: on the way down that is every field losing focus, as one does to the press itself; on
+    // the way up, where none of those bubble, it is the window's own.
+    let letGo: ReturnType<typeof setTimeout> | undefined;
+    const onRelease = () => {
+      if (!pressedRef.current) return;
+      pressedRef.current = false;
+      letGo = setTimeout(syncHold, 0);
+    };
+    const onVisibility = () => {
+      if (document.hidden) onRelease();
+    };
+    const releases = ["pointerup", "pointercancel"] as const;
+    document.addEventListener("selectionchange", onSelection);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onRelease);
+    for (const type of releases) window.addEventListener(type, onRelease, true);
+    return () => {
+      clearTimeout(letGo);
+      document.removeEventListener("selectionchange", onSelection);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onRelease);
+      for (const type of releases) window.removeEventListener(type, onRelease, true);
+    };
+  }, [syncHold]);
+  /**
+   * Whether the hold has lasted long enough to name. Every click holds the view for as long as the button is down,
+   * and a note that flashed on each one would be noise; a press kept, or a selection, is worth the words.
+   */
+  const [heldLong, setHeldLong] = useState(false);
+  useEffect(() => {
+    if (!stream.held) {
+      setHeldLong(false);
+      return;
+    }
+    const timer = setTimeout(() => setHeldLong(true), HELD_NOTE_MS);
+    return () => clearTimeout(timer);
+  }, [stream.held]);
   /**
    * The restarts the "Scrollback cleared" notice is not about. That notice says a
    * change of window reopened the stream and nothing already sent comes back. A change
@@ -871,10 +955,11 @@ function LogsStream({
    */
   const rowOf = useMemo(() => {
     const cache = new WeakMap<StreamLine, Row>();
+    let next = 0;
     return (line: StreamLine): Row => {
       let row = cache.get(line);
       if (row === undefined) {
-        row = toRow(line, byLabel);
+        row = toRow(line, byLabel, next++);
         cache.set(line, row);
       }
       return row;
@@ -982,16 +1067,36 @@ function LogsStream({
   const clauses = applied.ok ? applied.clauses : NO_CLAUSES;
 
   /** The pod boxes and the container select: the scope every view starts from. */
-  const scoped = useMemo(
-    () => rows.filter((row) => !hidden.includes(row.pod) && (container === ALL_CONTAINERS || row.container === container)),
-    [rows, hidden, container],
+  const inScope = useCallback(
+    (row: Row) => !hidden.includes(row.pod) && (container === ALL_CONTAINERS || row.container === container),
+    [hidden, container],
   );
+  /** Every filter applied: what the body draws, from every batch. */
+  const filtered = useMemo(
+    () =>
+      rows.filter(
+        (row) =>
+          inScope(row) &&
+          (clauses.length === 0 || matchLine(row, clauses)) &&
+          (range === undefined || inRange(row, range)),
+      ),
+    [rows, inScope, clauses, range],
+  );
+  /**
+   * The rows the rail, the facets and the histogram count. Each count is a pass over the whole buffer, and a busy
+   * stream commits every frame: while lines are arriving these take the stream's rows at most four times a second,
+   * the last batch always landing. A filter still applies at once, over the rows they have. Paused or reading a
+   * snapshot, nothing is arriving to hold back.
+   */
+  const counted = useThrottledValue(rows, following ? RECOUNT_MS : 0);
+  const scoped = useMemo(() => counted.filter(inScope), [counted, inScope]);
   /** The query applied, but not the window: what the histogram counts, so it can shade the window instead of cropping to it. */
   const queried = useMemo(
     () => (clauses.length === 0 ? scoped : scoped.filter((row) => matchLine(row, clauses))),
     [scoped, clauses],
   );
-  const filtered = useMemo(
+  /** The body's lines as of the last recount: what the rail tallies. */
+  const countedFiltered = useMemo(
     () => (range === undefined ? queried : queried.filter((row) => inRange(row, range))),
     [queried, range],
   );
@@ -1006,7 +1111,7 @@ function LogsStream({
    * array while the names are unchanged — a new array on every batch would
    * recount every facet in the urgent render, ahead of the deferral below.
    */
-  const deferredRows = useDeferredValue(rows);
+  const deferredRows = useDeferredValue(counted);
   const fieldsRef = useRef<string[]>([]);
   const fields = useMemo(() => {
     const next = discoverFields(deferredRows);
@@ -1099,7 +1204,7 @@ function LogsStream({
 
   /**
    * What the rail tallies: THE LINES THE BODY IS DRAWING, with every filter
-   * applied — and each one's RFC3339 stamp already off.
+   * applied, as of the last recount — and each one's RFC3339 stamp already off.
    *
    * The stamp is the trap. A stamped line opens with a digit, `tallyLogTerms`
    * reads a leading digit as a value and ends the term run there, so a stamped
@@ -1112,8 +1217,8 @@ function LogsStream({
    * `time=…`, and the tally would end the term there and show nothing.
    */
   const railLines = useMemo<TermLine[]>(
-    () => filtered.map((row) => ({ source: row.pod, text: row.text, message: row.message, health: row.health })),
-    [filtered],
+    () => countedFiltered.map((row) => ({ source: row.pod, text: row.text, message: row.message, health: row.health })),
+    [countedFiltered],
   );
 
   /**
@@ -1212,15 +1317,9 @@ function LogsStream({
     measure();
   }
 
-  // A provider's stream that ended sends no more statuses, so the hook's last one
-  // would go on saying it follows: the ending is what the readout says instead.
-  const ended = chosen ? provider.end : null;
   const signal = ended
     ? logConnectionStatus(ended.type === "error" ? "error" : "completed")
     : connectionSignal(stream.status, stream.paused);
-  /** Whether new lines are arriving in THIS pane. A snapshot is not followed,
-   *  however healthy the connection underneath it is. */
-  const following = !previous && !stream.paused && !ended;
   // A provider sends its history again on every restart, so none of its restarts
   // cleared anything; the notice is about the cluster's own stream alone.
   const restarted = !chosen && stream.restartCount > seenRestart;
@@ -1579,6 +1678,12 @@ function LogsStream({
               {groupNumber(stream.pendingWhilePaused)} new lines
             </Eyebrow>
           )}
+          {/* Why a following pane stopped moving under a press or a selection, and what waits for its release. */}
+          {!previous && !stream.paused && stream.held && heldLong && (
+            <Eyebrow>
+              {`Held while you select${stream.pendingWhilePaused > 0 ? ` · ${groupNumber(stream.pendingWhilePaused)} new lines` : ""}`}
+            </Eyebrow>
+          )}
           {!previous && (
             <LiveSignal
               label={connectionLabel(
@@ -1713,6 +1818,10 @@ function LogsStream({
         <div
           ref={viewportRef}
           onScroll={trackScroll}
+          onPointerDown={() => {
+            pressedRef.current = true;
+            syncHold();
+          }}
           // A tab stop: the arrow keys move the selection, so the log has to be reachable without a pointer.
           tabIndex={0}
           onKeyDown={onLogKeyDown}
@@ -1777,13 +1886,13 @@ function LogsStream({
               {window_.topPad > 0 && (
                 <div style={{ height: window_.topPad }} aria-hidden="true" />
               )}
-              {drawn.map((row, i) => (
-                // The index is the key: two identical lines a second apart are
-                // ordinary in a log, so nothing in a line is a stable identity.
-                // It sits on the wrapper, which is the click target and carries
-                // the selection; `.logline` inside it is what `measure` reads.
+              {drawn.map((row) => (
+                // The row's own id is the key, so a drawn line keeps its element
+                // while the batches move it (see `Row.id`). It sits on the wrapper,
+                // which is the click target and carries the selection; `.logline`
+                // inside it is what `measure` reads.
                 <div
-                  key={window_.start + i}
+                  key={row.id}
                   aria-current={row === selected ? "true" : undefined}
                   onClick={() => {
                     // A drag that selected text to copy is not a request for the panel.

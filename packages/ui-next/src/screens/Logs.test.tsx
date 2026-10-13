@@ -30,6 +30,9 @@ const h = vi.hoisted(() => {
       error: undefined as { title: string; detail: string; raw: string } | undefined,
       paused: false,
       pending: 0,
+      /** Whether the screen holds the view, and the lines it holds it on: see `holdStream`. */
+      held: false,
+      heldLines: [] as { source: string; text: string }[],
       /** Per-target truth: how many are streaming, how many are down, of how
        *  many altogether. */
       live: 4,
@@ -97,11 +100,13 @@ vi.mock("../lib/logStream", async () => {
       );
       h.seen.push({ context, namespace, targets, options });
       return {
-        lines: h.state.lines,
+        lines: h.state.held ? h.state.heldLines : h.state.lines,
         dropped: h.state.dropped,
         status: h.state.status,
         error: h.state.error,
         paused: h.state.paused,
+        held: h.state.held,
+        hold: holdStream,
         pendingWhilePaused: h.state.pending,
         liveTargets: h.state.live,
         completedTargets: h.state.completed,
@@ -195,6 +200,17 @@ import * as store from "../lib/tabsStore";
 function notify() {
   h.version += 1;
   for (const listener of [...h.listeners]) listener();
+}
+
+/**
+ * The hook's `hold`, as its contract has it (`logStream.test.ts` pins the real one): while held, the screen is
+ * handed the lines it had when the hold began, whatever arrives; on release, the lines as they are now.
+ */
+function holdStream(on: boolean) {
+  if (h.state.held === on) return;
+  h.state.held = on;
+  h.state.heldLines = h.state.lines;
+  notify();
 }
 
 const CTX: ClusterContext = {
@@ -308,6 +324,8 @@ beforeEach(() => {
     error: undefined,
     paused: false,
     pending: 0,
+    held: false,
+    heldLines: [],
     live: 4,
     completed: 0,
     reconnecting: 0,
@@ -2286,7 +2304,8 @@ describe("structured lines and the query (#898)", () => {
     h.facetPasses.length = 0;
     // No new field and no new value: the same three facets, one line heavier.
     push(line("api-9/api", "14:07:44.010000000", '{"level":"info","msg":"Wrote again","system":"camlog"}'));
-    expect(screen.getByRole("button", { name: "level = info, 2 lines" })).toBeTruthy();
+    // Within a quarter second of the last batch, so the recount lands when that is up.
+    expect(await screen.findByRole("button", { name: "level = info, 2 lines" })).toBeTruthy();
     // The Level facet and the one discovered field, once each: the deferred
     // pass. The urgent render must not rerun the field's count because the
     // list of fields came back as a new array of the same names.
@@ -2992,5 +3011,267 @@ describe("the line detail (#898)", () => {
         restore();
       }
     });
+  });
+});
+
+describe("under a busy stream (#898)", () => {
+  const caption = () => document.querySelector('[data-slot="volume-caption"]')?.textContent ?? "";
+  const anotherError = line("api-8/api", "14:07:45.100000000", "error pool timeout waited=30.1s in_use=6");
+  const many = (n: number, from = 0) =>
+    Array.from({ length: n }, (_, i) => line("api-7/api", "14:07:41.208000000", `line ${from + i}`));
+  /** A full ring's next batch: `n` lines off the front and `n` new ones on the end. */
+  function ring(n: number, next: number) {
+    act(() => {
+      h.state.lines = [...h.state.lines.slice(n), ...many(n, next)];
+      h.state.dropped += n;
+      notify();
+    });
+  }
+  const lineRow = (n: number) =>
+    Array.from(logRegion().querySelectorAll(".logline")).find((r) => r.textContent?.includes(`line ${n}`)) as Element;
+
+  it("keeps a drawn line on its own element while a full ring drops lines from the front", async () => {
+    // An element that is handed another line under the pointer turns a click, or a selection, into one of that line.
+    await (draw(), body());
+    push(...many(30));
+    const drawn = lineRow(10);
+    ring(5, 30);
+    expect(drawn.isConnected).toBe(true);
+    expect(drawn.textContent).toContain("line 10");
+  });
+
+  it("recounts the rail, the facets and the histogram at most four times a second, and the last batch always lands", async () => {
+    // The quarter second is read off the clock; stopped, a slow machine cannot run it out between two batches.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const region = await (draw(), body());
+      push(...LINES);
+      expect(screen.getByText("1 error")).toBeTruthy();
+      push(anotherError);
+      // The body draws every batch.
+      expect(rendered(region)).toHaveLength(5);
+      // The counts wait out the quarter second since their last recount.
+      expect(screen.getByText("1 error")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "level = error, 1 line" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "error 1" })).toBeTruthy();
+      expect(caption()).toMatch(/^4 lines · /);
+      await waitFor(() => {
+        expect(screen.getByText("2 errors")).toBeTruthy();
+        expect(screen.getByRole("button", { name: "level = error, 2 lines" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "error 2" })).toBeTruthy();
+        expect(caption()).toMatch(/^5 lines · /);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("holding the view while the reader works in it", () => {
+    const heldNote = () => screen.queryByText(/^Held while you select/);
+    /** The task after a release, which is when the screen lets go of a press. */
+    const released = () => act(() => new Promise((r) => setTimeout(r, 0)));
+    /** A press on `el`, and its release, as a browser sends them: the pointer's event, then the mouse's. */
+    const press = (el: Element) => {
+      fireEvent.pointerDown(el);
+      fireEvent.mouseDown(el);
+    };
+    const lift = (el: Element) => {
+      fireEvent.pointerUp(el);
+      fireEvent.mouseUp(el);
+    };
+    /** Select `node`'s text, a caret at its start, or nothing, and say so the way the browser does. */
+    const select = (node: Node | null, caret = false) =>
+      act(() => {
+        const selection = document.getSelection() as Selection;
+        if (node === null) selection.removeAllRanges();
+        else if (caret) selection.collapse(node, 0);
+        else selection.selectAllChildren(node);
+        document.dispatchEvent(new Event("selectionchange"));
+      });
+
+    it("holds the view while the mouse is down in the log, and lets go when it comes up, leaving Pause alone", async () => {
+      const region = await (draw(), body());
+      push(...many(5));
+      press(lineRow(2));
+      push(...many(3, 5));
+      expect(rendered(region)).toHaveLength(5);
+      // The reader's own control still says what they chose.
+      expect(screen.getByRole("button", { name: "Pause" })).toBeTruthy();
+      lift(lineRow(2));
+      await released();
+      expect(rendered(region)).toHaveLength(8);
+    });
+
+    it.each([
+      ["a pointerup anywhere in the window", () => fireEvent.pointerUp(window)],
+      ["a pointercancel", () => fireEvent.pointerCancel(window)],
+      ["the window losing focus", () => fireEvent.blur(window)],
+      [
+        "the window being hidden",
+        () => {
+          Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+          fireEvent(document, new Event("visibilitychange"));
+        },
+      ],
+    ])("lets go of a press on %s, though not of a selection", async (_, end) => {
+      // A release that never reaches the log, or never comes at all, must not leave the view held.
+      try {
+        const region = await (draw(), body());
+        push(...many(5));
+        press(lineRow(2));
+        push(...many(3, 5));
+        expect(rendered(region)).toHaveLength(5);
+        end();
+        await released();
+        expect(rendered(region)).toHaveLength(8);
+        // A selection is let go of only by collapsing or leaving the log. (jsdom also queues a selectionchange of
+        // its own a task after the selection; it is let through first, so it cannot put back what `end` took.)
+        select(lineRow(2));
+        await released();
+        push(...many(1, 8));
+        end();
+        await released();
+        expect(rendered(region)).toHaveLength(8);
+      } finally {
+        delete (document as { hidden?: boolean }).hidden;
+      }
+    });
+
+    it("lets go of a press though something on the page stops its release on the way up", async () => {
+      const region = await (draw(), body());
+      push(...many(5));
+      press(lineRow(2));
+      push(...many(3, 5));
+      const swallow = (e: Event) => e.stopPropagation();
+      document.body.addEventListener("pointerup", swallow);
+      try {
+        fireEvent.pointerUp(document.body);
+        await released();
+        expect(rendered(region)).toHaveLength(8);
+      } finally {
+        document.body.removeEventListener("pointerup", swallow);
+      }
+    });
+
+    it("keeps holding when the press takes focus from the search box: only the window losing it lets go", async () => {
+      const region = await (draw(), body());
+      push(...many(5));
+      press(lineRow(2));
+      fireEvent.blur(filterField());
+      push(...many(3, 5));
+      await released();
+      expect(rendered(region)).toHaveLength(5);
+    });
+
+    it("lets go of nothing once the screen has gone, though the release came before it went", async () => {
+      // The hold is let go of a task after the release; by then there may be no screen, and no stream, to let go.
+      const view = draw();
+      await body();
+      push(...many(5));
+      press(lineRow(2));
+      fireEvent.pointerUp(window);
+      view.unmount();
+      await released();
+      expect(h.state.held).toBe(true);
+    });
+
+    it("holds the view while text is selected in the log, and lets go when it is cleared", async () => {
+      const region = await (draw(), body());
+      push(...many(5));
+      // A selection elsewhere on the screen is not the log's.
+      select(screen.getByRole("button", { name: "Wrap" }));
+      push(...many(1, 5));
+      expect(rendered(region)).toHaveLength(6);
+      select(lineRow(2));
+      push(...many(3, 6));
+      expect(rendered(region)).toHaveLength(6);
+      // A caret is no selection: it is where a click in the log leaves one.
+      select(lineRow(2), true);
+      expect(rendered(region)).toHaveLength(9);
+      select(lineRow(2));
+      push(...many(1, 9));
+      expect(rendered(region)).toHaveLength(9);
+      select(null);
+      expect(rendered(region)).toHaveLength(10);
+    });
+
+    it("says the view is held only once a hold has lasted, never for an ordinary click", async () => {
+      // Every click holds the view for as long as the button is down; a note that flashed on each one would be noise.
+      await (draw(), body());
+      push(...many(5));
+      vi.useFakeTimers();
+      try {
+        press(lineRow(2));
+        act(() => vi.advanceTimersByTime(100));
+        expect(heldNote()).toBeNull();
+        lift(lineRow(2));
+        act(() => vi.advanceTimersByTime(1000));
+        expect(heldNote()).toBeNull();
+        // A selection kept is a hold worth naming, and what waits behind it.
+        select(lineRow(3));
+        h.state.pending = 3;
+        push(...many(3, 5));
+        act(() => vi.advanceTimersByTime(299));
+        expect(heldNote()).toBeNull();
+        act(() => vi.advanceTimersByTime(1));
+        expect(heldNote()?.textContent).toBe("Held while you select · 3 new lines");
+        select(null);
+        expect(heldNote()).toBeNull();
+        // The next hold is timed afresh: a click after a long selection is still only a click.
+        press(lineRow(2));
+        act(() => vi.advanceTimersByTime(100));
+        expect(heldNote()).toBeNull();
+        lift(lineRow(2));
+        act(() => vi.advanceTimersByTime(0));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("opens the line detail on the line pressed, though lines arrive and the view follows them before the release", async () => {
+      // A following view moves on every batch: the release lands on another row, or on none, and is no click at all.
+      const restore = measurableRows();
+      try {
+        const region = await (draw(), body());
+        // jsdom lays nothing out: a viewport 100px tall over the lines the screen is handed, 20px each.
+        let top = 0;
+        const height = () => (h.state.held ? h.state.heldLines : h.state.lines).length * 20;
+        Object.defineProperty(region, "clientHeight", { configurable: true, get: () => 100 });
+        Object.defineProperty(region, "scrollHeight", { configurable: true, get: height });
+        Object.defineProperty(region, "scrollTop", {
+          configurable: true,
+          get: () => top,
+          set: (v: number) => {
+            top = Math.max(0, Math.min(v, height() - 100));
+          },
+        });
+        push(...many(300));
+        fireEvent.scroll(region);
+        const pressed = lineRow(297);
+        press(pressed);
+        push(...many(100, 300));
+        // The browser reports the scroll that following the end made.
+        fireEvent.scroll(region);
+        lift(pressed);
+        fireEvent.click(pressed);
+        expect(screen.getByRole("region", { name: "Line detail" }).textContent).toContain("line 297");
+        // Then the screen lets the lines that waited in, under the panel still on that line.
+        expect(h.state.held).toBe(true);
+        await released();
+        expect(h.state.held).toBe(false);
+        expect(screen.getByRole("region", { name: "Line detail" }).textContent).toContain("line 297");
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  it("recounts at once while paused, when nothing is arriving to hold back", async () => {
+    await (draw(), body());
+    await userEvent.click(screen.getByRole("button", { name: "Pause" }));
+    push(...LINES);
+    push(anotherError);
+    expect(screen.getByText("2 errors")).toBeTruthy();
+    expect(caption()).toMatch(/^5 lines · /);
   });
 });
