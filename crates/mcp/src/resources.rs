@@ -200,8 +200,8 @@ impl ObjectWatcher for NoWatcher {
 
 /// Whether a URI can be subscribed to. The catalog and the context list are
 /// fixed listings rather than watchable objects, logs are a stream rather
-/// than a state change, and events would need to watch a different object
-/// than the one the URI names (see the `Events` arm below).
+/// than a state change. Event collections are watchable through the Event
+/// objects referencing the resource named by the URI.
 pub fn is_subscribable(uri: &ResourceUri) -> Result<(), String> {
     match uri {
         ResourceUri::Catalog => {
@@ -215,19 +215,6 @@ pub fn is_subscribable(uri: &ResourceUri) -> Result<(), String> {
         ResourceUri::Object { sub: Some(SubResource::Logs { .. }), .. } => {
             Err("pod logs are a stream, not a state change; subscribe to the \
                  pod's manifest instead"
-                .to_string())
-        }
-        ResourceUri::Object { sub: Some(SubResource::Events), .. } => {
-            // A watcher keyed on the URI's (context, namespace, kind, name)
-            // would watch the *object* the URI names, not the Event objects
-            // that reference it via `involvedObject` — so an Event with no
-            // matching object mutation would never notify, and an unrelated
-            // change to the object itself would notify spuriously. Watching
-            // real Event objects filtered by involvedObject is the
-            // feature-complete answer, but that's new scope (a follow-up),
-            // not this fix.
-            Err("events are not subscribable; subscribe to the object's \
-                 manifest instead"
                 .to_string())
         }
         ResourceUri::Object { .. } => Ok(()),
@@ -520,19 +507,11 @@ mod tests {
         assert!(is_subscribable(&ResourceUri::Contexts).is_err());
     }
 
-    /// `/events` is not subscribable: `CacheWatcher` destructures the URI with
-    /// `..` and drops `sub`, so a watch on an `/events` URI would actually
-    /// watch the named object, not the Event objects that reference it — an
-    /// Event with no matching object mutation would never notify, and an
-    /// unrelated object change would notify spuriously. Until real Event
-    /// objects are watched (a follow-up), refuse the subscription outright,
-    /// exactly as `/logs` already is.
     #[test]
-    fn events_are_not_subscribable() {
-        let err = is_subscribable(&ResourceUri::parse("k8s://c/ns/Pod/p/events").unwrap())
-            .unwrap_err();
-        assert!(err.contains("not subscribable"), "got: {err}");
-        assert!(err.contains("manifest"), "got: {err}");
+    fn event_collections_are_subscribable() {
+        for uri in ["k8s://c/ns/Pod/p/events", "k8s://c/-/Node/n/events"] {
+            assert!(is_subscribable(&ResourceUri::parse(uri).unwrap()).is_ok(), "{uri}");
+        }
     }
 
     /// The predicate must not diverge from the real watcher: `k8s://contexts`
