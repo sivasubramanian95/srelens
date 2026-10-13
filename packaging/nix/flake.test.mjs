@@ -33,9 +33,11 @@ test("the package version is the workspace version", () => {
   assert.doesNotMatch(flake, new RegExp(`version = "${version[1]}"`));
 });
 
-test("the flake uses the pnpm major package.json pins", () => {
-  const major = JSON.parse(read("package.json")).packageManager.match(/^pnpm@(\d+)\./)[1];
-  assert.match(flake, new RegExp(`pnpm_${major}\\b`));
+test("the flake packages the exact pnpm version pinned by package.json", () => {
+  assert.match(flake, /packageManager = \(builtins\.fromJSON \(builtins\.readFile \.\/package\.json\)\)\.packageManager/);
+  assert.match(flake, /pnpmVersion = builtins\.elemAt \(builtins\.match "pnpm@\(\[\^\+\]\+\)/);
+  assert.match(flake, /builtins\.getAttr "pnpm_\$\{pnpmMajor\}" pkgs\)\.override/);
+  assert.match(flake, /version = pnpmVersion/);
 });
 
 test("every git crate in Cargo.lock has an importCargoLock hash", () => {

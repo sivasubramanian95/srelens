@@ -18,6 +18,16 @@
       # One version, the workspace's. A literal here would drift from Cargo.toml.
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
+      packageManager = (builtins.fromJSON (builtins.readFile ./package.json)).packageManager;
+      pnpmVersion = builtins.elemAt (builtins.match "pnpm@([^+]+)(\\+.*)?" packageManager) 0;
+      pnpmMajor = nixpkgs.lib.versions.major pnpmVersion;
+      pnpmFor =
+        pkgs:
+        (builtins.getAttr "pnpm_${pnpmMajor}" pkgs).override {
+          version = pnpmVersion;
+          hash = "sha256-0eqyQzFyZhzDahjshfzpP3cdsZYnFzKcwB7JwoJMok8=";
+        };
+
       # Cargo.lock vendors a git crate (fix-path-env) with no checksum. importCargoLock
       # refuses that unless we name the hash. packaging/nix/flake.test.mjs fails when a
       # new git source appears here without an entry.
@@ -42,10 +52,9 @@
         let
           cargoDeps = pkgs.rustPlatform.importCargoLock cargoLock;
 
-          # pnpm 11, the major package.json pins. nixpkgs' default pnpm is a later
-          # major, and an older one cannot read the overrides in pnpm-workspace.yaml
-          # (the lockfile then fails with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH).
-          pnpm = pkgs.pnpm_11;
+          # Use the exact packageManager version so Nix reads the same lockfile
+          # configuration and overrides as the other install paths.
+          pnpm = pnpmFor pkgs;
           nodejs = pkgs.nodejs_26;
 
           # Release builds of the desktop binary and srelens-server embed this
@@ -278,7 +287,7 @@
               pkgs.cargo
               pkgs.clippy
               pkgs.nodejs_26
-              pkgs.pnpm_11
+              (pnpmFor pkgs)
               pkgs.pkg-config
             ];
           };

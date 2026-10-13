@@ -87,10 +87,20 @@ jobs:
         # Nothing builds these files; a dead image only shows on GitHub.
         run: node --test scripts/docs/readme.test.mjs
       - name: Nix flake contract
-        # The install commands in docs/INSTALL.md, the pnpm major, and a hash
-        # for every git crate importCargoLock has to vendor. No Nix install
-        # and no build — those are what `nix build` is for.
+        # The install commands in docs/INSTALL.md, the exact pnpm version, and
+        # a hash for every git crate importCargoLock has to vendor.
         run: node --test packaging/nix/flake.test.mjs
+
+  nix:
+    name: Nix packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Evaluate flake outputs
+        run: nix flake show
+      - name: Build Linux server package
+        run: nix build .#srelens-server --no-link
 
   backend:
     name: backend
