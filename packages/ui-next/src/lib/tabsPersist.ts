@@ -3,6 +3,7 @@ import { detailRoute, parseDetailRoute } from "./detailRoute";
 import { loadRestoreSession, scopedSettingsKey, settingsStorage } from "@srelens/core";
 import type { TableSort } from "@srelens/ui-kit";
 import type { ClusterStrip, Tab, TabsState, Workspace } from "./tabs";
+import { isPaletteColor } from "./markSymbols";
 
 /**
  * Where the shell's tabs live between launches.
@@ -133,6 +134,10 @@ function parseWorkspace(v: unknown): Workspace | null {
   // Not the cluster in focus: its tabs are the strip itself.
   const shelved = parseShelved(v.shelved, clusters.filter((id) => id !== ws.activeCluster));
   if (shelved) ws.shelved = shelved;
+  // Only a palette colour: the chip paints whatever it is handed, and a value
+  // from a hand-edited file or another build's palette is not one this build
+  // can name.
+  if (isPaletteColor(v.color)) ws.color = v.color;
   return ws;
 }
 

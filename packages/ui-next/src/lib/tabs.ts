@@ -69,6 +69,13 @@ export interface ClusterStrip {
 export interface Workspace {
   id: string;
   name: string;
+  /**
+   * A {@link PALETTE} value (`lib/markSymbols.ts`), drawn beside the name on
+   * the title-bar chip and the switcher. Absent means no colour. On the
+   * workspace rather than in a setting keyed by its id, so it is saved,
+   * restored and deleted with it.
+   */
+  color?: string;
   /** `ClusterContext.stableId`s. Never display names — see #265. */
   clusters: string[];
   /** Clusters the reader has paused without removing from this workspace. */
@@ -293,6 +300,16 @@ export function withOverview(w: Workspace, clusterName?: string): Workspace {
   if (w.activeCluster === undefined || w.tabs.some(followsFocus)) return w;
   const overview = makeTab("/overview", { clusterName });
   return { ...w, tabs: [...w.tabs, overview], activeId: overview.id };
+}
+
+/**
+ * Every tab open in a workspace: the strip on screen and the strips put away
+ * under its other clusters, which close with it too. A plain sum, because a
+ * strip is put away holding only its own cluster's tabs (see
+ * {@link focusStrip}): the app-wide ones stay on screen, so none is in two.
+ */
+export function workspaceTabCount(w: Workspace): number {
+  return Object.values(w.shelved ?? {}).reduce((n, strip) => n + strip.tabs.length, w.tabs.length);
 }
 
 /** A workspace's shelved strips, less those of clusters it no longer has. */

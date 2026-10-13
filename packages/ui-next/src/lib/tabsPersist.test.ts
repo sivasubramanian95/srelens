@@ -159,6 +159,25 @@ describe("parseStoredState", () => {
     expect(parseStoredState(raw)?.workspaces[0].activeCluster).toBeUndefined();
   });
 
+  it("round-trips a workspace's colour", () => {
+    const s = valid();
+    s.workspaces[0].color = "var(--mark-teal)";
+    expect(parseStoredState(JSON.stringify({ version: 1, ...s }))?.workspaces[0].color).toBe("var(--mark-teal)");
+  });
+
+  it("drops a colour that is not in the mark palette", () => {
+    for (const junk of ['"#ff0000"', "7", '"var(--accent)"']) {
+      const s = valid();
+      s.workspaces[0].color = "var(--mark-teal)";
+      const raw = JSON.stringify({ version: 1, ...s }).replace('"color":"var(--mark-teal)"', `"color":${junk}`);
+      expect(parseStoredState(raw)?.workspaces[0], junk).not.toHaveProperty("color");
+    }
+  });
+
+  it("reads a workspace saved before colours existed with no colour", () => {
+    expect(parseStoredState(JSON.stringify({ version: 1, ...valid() }))?.workspaces[0]).not.toHaveProperty("color");
+  });
+
   /** The tabs of the clusters not in focus (#908). */
   describe("the strips put away", () => {
     const shelving = (): TabsState => {
