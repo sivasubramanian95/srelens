@@ -1,23 +1,38 @@
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import {
   absoluteTimestamp,
   describeStreamEnd,
+  clauseState,
+  discoverFields,
+  inRange,
   logConnectionStatus,
   logLineHealth,
   logLineLevel,
+  logLineWords,
+  matchLine,
+  parseLogFields,
+  parseLogQuery,
   podLogs,
-  type HealthKind,
+  toggleClause,
+  type ClauseMode,
+  type ClauseTarget,
   type LogConnectionVerdict,
   type LogLine as StreamLine,
   type LogTarget,
+  type QueryClause,
+  type QueryLine,
+  type TermLine,
+  type TimeRange,
 } from "@srelens/core";
 import {
   Alert,
@@ -56,11 +71,16 @@ import { recentKey, rememberLogSubject, useOfferedRecents } from "../lib/logRece
 import { useMarkLogStream } from "../lib/liveLogStreams";
 import { useTabScope } from "../lib/tabScope";
 import { openTab } from "../lib/tabsStore";
+import { FilterPills } from "./logs/FilterPills";
+import { LineDetail } from "./logs/LineDetail";
+import { renderMessage } from "./logs/LogMessage";
 import {
   StreamRail,
   STREAM_RAIL_WIDTH,
   type StreamPod,
 } from "./logs/StreamRail";
+import { clockTime } from "./logs/time";
+import { VolumeHistogram } from "./logs/VolumeHistogram";
 import { NoClusterScreen } from "./resourceShell";
 
 /**
@@ -233,11 +253,31 @@ function connectionLabel(
  * when a stream is opened with `timestamps: true`, which this screen always is
  * because the design gives the time its own column.
  */
-const RFC3339 = /^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})(\.\d+)?(?:Z|[+-]\d{2}:?\d{2})? ?/;
+const RFC3339 = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:?\d{2})? ?/;
+
+/**
+ * The stamp as epoch ms, for the histogram and the time window. Rebuilt at
+ * millisecond precision rather than handed to `Date.parse` whole, because
+ * the parse is only specified for three fraction digits and the backend
+ * sends nine.
+ */
+function stampTime(stamp: RegExpMatchArray): number | undefined {
+  const [, date, time, fraction = "", zone] = stamp;
+  const offset = zone === undefined ? "" : zone.length === 5 ? `${zone.slice(0, 3)}:${zone.slice(3)}` : zone;
+  const ms = Date.parse(`${date}T${time}${fraction.slice(0, 4)}${offset}`);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/** No clauses: the query is empty, or it does not parse and so is not applied. */
+const NO_CLAUSES: readonly QueryClause[] = [];
 
 /** One line as the body draws it: the four columns, plus what a filter reads. */
-interface Row {
-  /** `14:07:41.208`, or `""` for a line that arrived without a stamp. */
+interface Row extends QueryLine {
+  /**
+   * The line's instant on the reader's clock, `HH:MM:SS.mmm`, or `""` for a
+   * line without a parseable stamp. Derived from `at`, so the two cannot
+   * disagree about when the line happened.
+   */
   ts: string;
   /** Which pod wrote the line. DATA — read off the target, not the label. */
   pod: string;
@@ -274,15 +314,13 @@ interface Row {
    * it: a call site that maps "error" to red itself is how the same word ends
    * up red on one screen and grey on the next.
    */
-  level: string;
-  /**
-   * Core's severity for the line, from {@link logLineHealth} — a text-scan
-   * heuristic over the same one rule the level word comes from. Not drawn;
-   * it is here so the filter can match `danger` and `warning` as well as the
-   * literal word the line used.
-   */
-  health: HealthKind;
-  message: string;
+  readonly level: string;
+  /** The line with its stamp off — what the term tally and a regex clause read. An export writes {@link Row.raw}. */
+  readonly text: string;
+  /** What the message column leads with: a JSON or logfmt `msg`, else `text`. */
+  readonly message: string;
+  /** Whether `message` came out of a field, so the row appends the rest inline. */
+  readonly structured: boolean;
   /** The line exactly as it arrived, stamp and all — what an export writes. */
   raw: string;
   /**
@@ -291,8 +329,6 @@ interface Row {
    * what the container wrote.
    */
   truncated: boolean;
-  /** Lower-cased message + severity word, which is what the filter matches. */
-  haystack: string;
 }
 
 /** The line's origin as one string: `api-7 · api` on screen, `api-7/api` in a
@@ -329,8 +365,12 @@ function indexTargets(targets: readonly LogTarget[]): ReadonlyMap<string, LogTar
  */
 function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>): Row {
   const stamp = line.text.match(RFC3339);
-  const ts = stamp ? `${stamp[1]}${(stamp[2] ?? "").slice(0, 4)}` : "";
-  const message = stamp ? line.text.slice(stamp[0].length) : line.text;
+  const at = stamp ? stampTime(stamp) : undefined;
+  // The reader's clock, like the histogram's axis and the window pill beside
+  // it, rather than the stamp's own wall time (UTC from the backend): two
+  // clocks on one screen put every line a zone's offset from the axis.
+  const ts = at === undefined ? "" : `${clockTime(at)}.${String(new Date(at).getMilliseconds()).padStart(3, "0")}`;
+  const text = stamp ? line.text.slice(stamp[0].length) : line.text;
   const slash = line.source.indexOf("/");
   const target = byLabel.get(line.source);
   const pod =
@@ -345,7 +385,8 @@ function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>): Row {
       : slash < 0
         ? ""
         : line.source.slice(slash + 1);
-  const health = logLineHealth(message);
+  const health = logLineHealth(text);
+  const parsed = parseLogFields(text);
   return {
     ts,
     pod,
@@ -354,12 +395,17 @@ function toRow(line: StreamLine, byLabel: ReadonlyMap<string, LogTarget>): Row {
     // otherwise be blank; a labelled one shows the container exactly when its
     // label carried it.
     namesContainer: line.source === "" || slash >= 0,
-    level: logLineLevel(message) ?? "",
+    level: logLineLevel(text) ?? "",
     health,
-    message,
+    text,
+    message: parsed.message,
+    structured: parsed.structured,
+    fields: parsed.fields,
+    words: logLineWords(parsed.message),
+    ...(at === undefined ? {} : { at }),
     raw: line.text,
     truncated: line.truncated === true,
-    haystack: `${message} ${health}`.toLowerCase(),
+    haystack: `${text} ${health}`.toLowerCase(),
   };
 }
 
@@ -699,6 +745,10 @@ function LogsStream({
 }) {
   const { ask } = useConsole();
   const [text, setText] = useState("");
+  /** The window picked off the histogram, if any. The one filter that isn't query text. */
+  const [range, setRange] = useState<TimeRange | undefined>(undefined);
+  /** Where focus goes when a pill is removed: the × that had it is about to unmount. */
+  const searchRef = useRef<HTMLInputElement>(null);
   // `all`, as classic has always defaulted, and not the design's drawn `5m`.
   // A mock is drawn against a fixture that never stops talking; a real
   // workload that has been quiet for six minutes renders "Nothing has been
@@ -724,6 +774,8 @@ function LogsStream({
   const [snapshot, setSnapshot] = useState<Snapshot>({ status: "idle" });
   /** Why the last export did not land, if it did not. */
   const [saveError, setSaveError] = useState<unknown>(undefined);
+  /** The line the detail panel is open on. The Row itself, so the panel outlives the line leaving the view. */
+  const [selected, setSelected] = useState<Row | null>(null);
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const rowsRef = useRef<HTMLDivElement>(null);
@@ -734,6 +786,21 @@ function LogsStream({
    * scroll that just happened, not from the render before it.
    */
   const stickRef = useRef(true);
+  /** An arrow key moved the selection and its row is still to be scrolled into view; see {@link revealSelected}. */
+  const revealRef = useRef(false);
+  /**
+   * The selected line as of the last commit or scroll, for the effect that holds it in place: its place in
+   * `filtered`, where its row is drawn within the rows (when it is drawn), how tall the earlier-lines banner
+   * was, and the scroll position.
+   */
+  const heldRef = useRef<{
+    row: Row;
+    index: number;
+    top: number | undefined;
+    banner: number;
+    scroll: number;
+    wrap: boolean;
+  } | null>(null);
 
   /**
    * Where the lines come from (#569): the cluster, or one of the installed apps'
@@ -753,6 +820,7 @@ function LogsStream({
   if (picked && !chosen && offered.status === "ready") {
     setPicked(null);
     setLost(picked.label);
+    setSelected(null);
   }
   const provider = useLogProviderSource(chosen, { context, namespace, resourceKind: resourceKind ?? "", name });
   const chooseSource = useCallback(
@@ -760,6 +828,8 @@ function LogsStream({
       const next = providers.find((p) => p.key === key);
       setPicked(next ? { key: next.key, label: next.label } : null);
       setLost(null);
+      // A different source is a different buffer: the line the panel holds is not in it.
+      setSelected(null);
       // A previous instance is the cluster's to hand back, never a provider's.
       if (next) setPrevious(false);
     },
@@ -791,10 +861,26 @@ function LogsStream({
   }
 
   const byLabel = useMemo(() => indexTargets(targets), [targets]);
-  const liveRows = useMemo(
-    () => stream.lines.map((l) => toRow(l, byLabel)),
-    [stream.lines, byLabel],
-  );
+  /**
+   * Each line made into a row ONCE. The ring hands back the same line objects
+   * on every commit (`appendLogLines` concatenates), so a cache keyed on the
+   * object turns "re-split every buffered line per arriving line" into one
+   * parse per line. That matters now that a row is a JSON parse and a logfmt
+   * scan, not one regex. Rebuilt with `byLabel`, which a row's pod and
+   * container are read through.
+   */
+  const rowOf = useMemo(() => {
+    const cache = new WeakMap<StreamLine, Row>();
+    return (line: StreamLine): Row => {
+      let row = cache.get(line);
+      if (row === undefined) {
+        row = toRow(line, byLabel);
+        cache.set(line, row);
+      }
+      return row;
+    };
+  }, [byLabel]);
+  const liveRows = useMemo(() => stream.lines.map((l) => rowOf(l)), [stream.lines, rowOf]);
 
   /**
    * Fetch the terminated containers' buffers.
@@ -864,8 +950,8 @@ function LogsStream({
   }, [previous, terminated, context, namespace, targets]);
 
   const previousRows = useMemo(
-    () => (snapshot.status === "ready" ? snapshot.lines.map((l) => toRow(l, byLabel)) : []),
-    [snapshot, byLabel],
+    () => (snapshot.status === "ready" ? snapshot.lines.map((l) => rowOf(l)) : []),
+    [snapshot, rowOf],
   );
 
   /**
@@ -885,18 +971,94 @@ function LogsStream({
     [targets],
   );
 
-  const query = text.trim().toLowerCase();
-  const filtered = useMemo(
-    () =>
-      rows.filter((row) => {
-        if (hidden.includes(row.pod)) return false;
-        if (container !== ALL_CONTAINERS && row.container !== container)
-          return false;
-        if (query !== "" && !row.haystack.includes(query)) return false;
-        return true;
-      }),
-    [rows, hidden, container, query],
+  /** The query as typed: the pills and facet toggles edit this text by the spans it reports. */
+  const typed = useMemo(() => parseLogQuery(text), [text]);
+  /**
+   * The query as applied, a beat behind the keystroke: React renders the box
+   * first and the pass over the buffer after, so typing never waits on it.
+   */
+  const deferredText = useDeferredValue(text);
+  const applied = useMemo(() => parseLogQuery(deferredText), [deferredText]);
+  const clauses = applied.ok ? applied.clauses : NO_CLAUSES;
+
+  /** The pod boxes and the container select: the scope every view starts from. */
+  const scoped = useMemo(
+    () => rows.filter((row) => !hidden.includes(row.pod) && (container === ALL_CONTAINERS || row.container === container)),
+    [rows, hidden, container],
   );
+  /** The query applied, but not the window: what the histogram counts, so it can shade the window instead of cropping to it. */
+  const queried = useMemo(
+    () => (clauses.length === 0 ? scoped : scoped.filter((row) => matchLine(row, clauses))),
+    [scoped, clauses],
+  );
+  const filtered = useMemo(
+    () => (range === undefined ? queried : queried.filter((row) => inRange(row, range))),
+    [queried, range],
+  );
+  /** In scope and in the window, but not queried: what the facets count over. */
+  const windowed = useMemo(
+    () => (range === undefined ? scoped : scoped.filter((row) => inRange(row, range))),
+    [scoped, range],
+  );
+  /**
+   * The buffer's facet fields, from every row: sections must not come and go as
+   * the reader filters. Found over the deferred rows and handed on as the SAME
+   * array while the names are unchanged — a new array on every batch would
+   * recount every facet in the urgent render, ahead of the deferral below.
+   */
+  const deferredRows = useDeferredValue(rows);
+  const fieldsRef = useRef<string[]>([]);
+  const fields = useMemo(() => {
+    const next = discoverFields(deferredRows);
+    const last = fieldsRef.current;
+    if (next.length === last.length && next.every((f, i) => f === last[i])) return last;
+    return (fieldsRef.current = next);
+  }, [deferredRows]);
+  /** The facets recount a beat behind, like the query, so a busy stream never starves the box. */
+  const facetLines = useDeferredValue(windowed);
+  /** The histogram counts the queried lines, not the windowed ones, and recounts a beat behind too. */
+  const volumeLines = useDeferredValue(queried);
+  /**
+   * What the legend offers: the query minus its level clauses, as the rail's
+   * Level facet counts, so picking a level leaves the others on offer. Not the
+   * window, for the legend describes the chart. With no level clause that is
+   * `queried` itself, and the pass over the buffer is not made twice.
+   */
+  const legendRows = useMemo(
+    () =>
+      clauses.some((c) => c.field?.toLowerCase() === "level")
+        ? scoped.filter((row) => matchLine(row, clauses, "level"))
+        : queried,
+    [scoped, clauses, queried],
+  );
+  const legendLines = useDeferredValue(legendRows);
+  /** A facet click: rewrites the search box, the one place filters live. */
+  const toggleFilter = useCallback(
+    (target: ClauseTarget, mode: ClauseMode) => setText((q) => toggleClause(q, target, mode)),
+    [],
+  );
+  /**
+   * A legend click: every level word of a group in (`include`) or out, in one
+   * update. `toggleClause` flips what is there, so only the words that are not
+   * already where the click wants them are flipped: with `level:error` typed,
+   * "put the group in" adds `fatal` and leaves `error` be. Each word is read
+   * off the text being edited, not off what the legend was drawn from, and a
+   * word that is excluded is not included, so it flips in place.
+   */
+  const toggleLevels = useCallback(
+    (words: string[], include: boolean) =>
+      setText((q) => {
+        const parsed = parseLogQuery(q);
+        const included = (value: string) =>
+          parsed.ok && clauseState(parsed.clauses, { field: "level", value }) === "include";
+        return words
+          .filter((value) => included(value) !== include)
+          .reduce((query, value) => toggleClause(query, { field: "level", value }, "include"), q);
+      }),
+    [],
+  );
+
+  const selectedIndex = selected === null ? -1 : filtered.indexOf(selected);
 
   const togglePod = useCallback((pod: string, checked: boolean) => {
     setHidden((current) =>
@@ -912,6 +1074,7 @@ function LogsStream({
    *  that reports "no lines match" cannot undo the tick that caused it. */
   const clearFilters = useCallback(() => {
     setText("");
+    setRange(undefined);
     setContainer(ALL_CONTAINERS);
     setHidden([]);
   }, []);
@@ -941,11 +1104,15 @@ function LogsStream({
    * The stamp is the trap. A stamped line opens with a digit, `tallyLogTerms`
    * reads a leading digit as a value and ends the term run there, so a stamped
    * buffer tallies to NOTHING — no error, no warning, just an empty rail that
-   * looks exactly like a quiet log. `row.message` is the stripped text; the
+   * looks exactly like a quiet log. `row.text` is the stripped text; the
    * raw line never goes near this.
+   *
+   * The row's message and severity go with it. The tally reads a JSON `msg`
+   * from the text, but not a logfmt one: a logfmt line opens with its own
+   * `time=…`, and the tally would end the term there and show nothing.
    */
-  const railLines = useMemo<StreamLine[]>(
-    () => filtered.map((row) => ({ source: row.pod, text: row.message })),
+  const railLines = useMemo<TermLine[]>(
+    () => filtered.map((row) => ({ source: row.pod, text: row.text, message: row.message, health: row.health })),
     [filtered],
   );
 
@@ -959,9 +1126,10 @@ function LogsStream({
    * far they happen to have scrolled, not of what they chose to look at.
    *
    * Each line goes out RAW, stamp and all, in classic's `source | line`
-   * shape. The column on screen truncates the stamp to `14:07:41.208` because
-   * a reader watching a live tail knows what day it is; a file read tomorrow
-   * does not, and the full RFC3339 is what makes an exported line greppable
+   * shape. The column on screen shows the time on the reader's clock, to the
+   * millisecond (`14:07:41.208`), because a reader watching a live tail knows
+   * what day it is; a file read tomorrow does not, and the full RFC3339, in
+   * the zone the cluster sent it, is what makes an exported line greppable
    * against anything else. Which lines are exported is what "on screen"
    * governs — not how much of each one an 86px gutter had room for.
    *
@@ -1033,9 +1201,14 @@ function LogsStream({
   function trackScroll() {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // A selected line pins the view: the scroll that reveals it can land within
+    // the slack of the end, and that is not the reader coming back to follow.
     stickRef.current =
+      selected === null &&
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <
-      STICK_SLACK;
+        STICK_SLACK;
+    // The reader moved, or the browser did: either way the next shift is measured from here.
+    if (heldRef.current !== null) heldRef.current.scroll = viewport.scrollTop;
     measure();
   }
 
@@ -1061,6 +1234,125 @@ function LogsStream({
   const drawn = window_.virtualized
     ? filtered.slice(window_.start, window_.end)
     : filtered;
+
+  /**
+   * Hold the selected line where it is on screen. Once the ring is full each
+   * batch drops lines from the front, and everything after them moves up under a
+   * `scrollTop` that has not changed: the line being read would slide out of
+   * view, and the panel opened on it would be left describing a line the
+   * reader can no longer see. So the view moves with the content, by how far the
+   * line's row moved.
+   *
+   * That is measured where the row is drawn, which counts everything above it
+   * that moved, the earlier-lines banner that the first drop brings in among it.
+   * A row outside the drawn slice has no element, and is placed by arithmetic
+   * instead: its place in `filtered` times the row height, and the banner. The
+   * new position is the last known one plus that shift, not the browser's
+   * current one plus it: a batch that shortens the content gets the scroll
+   * position clamped by the layout this effect has just forced, and a shift
+   * added on top of that would correct twice.
+   *
+   * It acts on a change to the lines or the selection, never on a scroll: the
+   * reader's own scrolling is theirs, and only moves where the shift is
+   * measured from. A line that is not in `filtered`, before or after, has
+   * nowhere to be held.
+   */
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const box = rowsRef.current;
+    const row = box?.querySelector<HTMLElement>('[aria-current="true"]');
+    // Within the rows, which scrolling does not change.
+    const top = box && row ? row.getBoundingClientRect().top - box.getBoundingClientRect().top : undefined;
+    const banner = box?.querySelector('[data-slot="dropped-banner"]')?.getBoundingClientRect().height ?? 0;
+    const held = heldRef.current;
+    if (
+      viewport !== null &&
+      held !== null &&
+      held.row === selected &&
+      held.wrap === wrap &&
+      held.index >= 0 &&
+      selectedIndex >= 0 &&
+      !stickRef.current
+    ) {
+      const moved =
+        top !== undefined && held.top !== undefined
+          ? top - held.top
+          : wrap
+            ? 0
+            : (selectedIndex - held.index) * metrics.rowHeight + banner - held.banner;
+      if (moved !== 0) {
+        viewport.scrollTop = held.scroll + moved;
+        // The window was drawn from the scroll position before this; draw it again from the new one.
+        measure();
+      }
+    }
+    heldRef.current =
+      selected === null || viewport === null
+        ? null
+        : { row: selected, index: selectedIndex, top, banner, scroll: viewport.scrollTop, wrap };
+  }, [filtered, selected, selectedIndex, wrap, metrics.rowHeight, window_.start, window_.end, measure]);
+
+  function moveSelection(step: 1 | -1) {
+    if (filtered.length === 0) return;
+    const next =
+      selectedIndex < 0
+        ? step > 0
+          ? 0
+          : filtered.length - 1
+        : Math.min(filtered.length - 1, Math.max(0, selectedIndex + step));
+    setSelected(filtered[next]);
+    // Reading, not following: a new line must not yank the view off the selection.
+    stickRef.current = false;
+    revealRef.current = true;
+    // A row outside the drawn slice has no element to scroll to. Fixed-height arithmetic gets the view near
+    // enough to draw it; it leaves out the scroller's padding and the dropped-lines banner, so it is only
+    // that close, and the reveal below settles the pixels.
+    const viewport = viewportRef.current;
+    if (viewport !== null && window_.virtualized && (next < window_.start || next >= window_.end)) {
+      viewport.scrollTop = next * metrics.rowHeight;
+    }
+    // Same row again (an arrow at the end of the buffer): no render is coming to reveal it.
+    if (next === selectedIndex) revealSelected();
+  }
+
+  /**
+   * Scroll the row an arrow key selected into view, once it has an element.
+   * The browser does the pixels: rows do not start at the top of the scroller
+   * (its padding, the dropped-lines banner), and wrapped rows differ in height,
+   * so no sum over a row height can say where one is. A row outside the slice
+   * is not there yet; the scroll that draws it comes back here through the effect.
+   * Only a key asks for it, so a reader who scrolls away is left where they are.
+   */
+  function revealSelected() {
+    if (!revealRef.current) return;
+    const row = rowsRef.current?.querySelector<HTMLElement>('[aria-current="true"]');
+    if (row === null || row === undefined) return;
+    revealRef.current = false;
+    row.scrollIntoView({ block: "nearest" });
+    // The view has moved, and the scroll event that says so only arrives at the next rendering step. A batch that
+    // lands before it is held from here, not from where the view was.
+    const viewport = viewportRef.current;
+    if (heldRef.current !== null && viewport !== null) heldRef.current.scroll = viewport.scrollTop;
+  }
+  useLayoutEffect(revealSelected, [selected, window_.start, window_.end]);
+
+  function closeDetail() {
+    setSelected(null);
+    // The × and Esc in the panel unmount the control that had focus; the log is where the reader was.
+    viewportRef.current?.focus();
+  }
+
+  function onLogKeyDown(e: KeyboardEvent) {
+    // A modified arrow is the browser's or the OS's (selection, word jumps, history).
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key === "ArrowDown") moveSelection(1);
+    else if (e.key === "ArrowUp") moveSelection(-1);
+    else if (e.key === "Escape" && selected !== null) closeDetail();
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
   const windowLabel = since !== "all" ? ` in the last ${since}` : chosen ? " in the last 7 days" : "";
 
   /** A corpse that refused, while others answered — a banner over lines that
@@ -1173,6 +1465,7 @@ function LogsStream({
             pods={railPods}
             lines={railLines}
             onTogglePod={togglePod}
+            query={{ lines: facetLines, clauses, fields, onToggle: toggleFilter }}
           />
         }
       >
@@ -1181,6 +1474,7 @@ function LogsStream({
           onValueChange={setText}
           label="Filter lines"
           placeholder="Filter lines"
+          inputRef={searchRef}
         >
           {providers.length > 0 && (
             <div className="flex items-center gap-1.5">
@@ -1240,7 +1534,13 @@ function LogsStream({
               variant="secondary"
               size="xs"
               aria-pressed={previous}
-              onClick={() => setPrevious((p) => !p)}
+              onClick={() => {
+                setPrevious((p) => !p);
+                // A different buffer: the line the panel holds is not in it, and a time window is a stretch
+                // of this instance's clock. A change of source keeps the window: it is the same stretch of time.
+                setSelected(null);
+                setRange(undefined);
+              }}
               style={
                 previous
                   ? {
@@ -1291,6 +1591,29 @@ function LogsStream({
             />
           )}
         </FilterBar>
+        {!typed.ok && (
+          // Not FilterBar's `invalid`, whose screen-reader text calls every
+          // problem an invalid regular expression. An unclosed quote is not one.
+          <div role="alert" className="mx-3 mt-2 text-[0.75rem]" style={{ color: toneColor("sev") }}>
+            {typed.error}
+          </div>
+        )}
+        <FilterPills
+          query={text}
+          clauses={typed.ok ? typed.clauses : NO_CLAUSES}
+          range={range}
+          onQueryChange={setText}
+          onRangeChange={setRange}
+          onRemoved={() => searchRef.current?.focus()}
+        />
+        <VolumeHistogram
+          lines={volumeLines}
+          legendLines={legendLines}
+          range={range}
+          onRangeChange={setRange}
+          clauses={typed.ok ? typed.clauses : NO_CLAUSES}
+          onToggleLevels={toggleLevels}
+        />
 
         {offered.status === "error" && (
           // The list the picker is drawn from could not be read again: what it
@@ -1390,9 +1713,12 @@ function LogsStream({
         <div
           ref={viewportRef}
           onScroll={trackScroll}
+          // A tab stop: the arrow keys move the selection, so the log has to be reachable without a pointer.
+          tabIndex={0}
+          onKeyDown={onLogKeyDown}
           role="log"
           aria-label={`${name} logs`}
-          className={`scroll min-h-0 flex-1 py-1 font-mono text-[0.75rem] leading-[1.85] ${
+          className={`scroll log-body min-h-0 flex-1 py-1 font-mono text-[0.75rem] leading-[1.85] ${
             wrap ? "" : "whitespace-nowrap"
           }`}
         >
@@ -1443,7 +1769,7 @@ function LogsStream({
                 // would let them believe they are. It is a fact about the LIVE
                 // ring, though: the previous instance's buffer arrived whole,
                 // in one fetch, and nothing has pushed anything out of it.
-                <div className="px-2.5 py-1 text-muted">
+                <div data-slot="dropped-banner" className="px-2.5 py-1 text-muted">
                   Showing the newest {groupNumber(filtered.length)} lines ·{" "}
                   {groupNumber(stream.dropped)} earlier lines dropped
                 </div>
@@ -1454,33 +1780,40 @@ function LogsStream({
               {drawn.map((row, i) => (
                 // The index is the key: two identical lines a second apart are
                 // ordinary in a log, so nothing in a line is a stable identity.
-                <LogLine
+                // It sits on the wrapper, which is the click target and carries
+                // the selection; `.logline` inside it is what `measure` reads.
+                <div
                   key={window_.start + i}
-                  ts={row.ts}
-                  source={sourceOf(row, " · ")}
-                  // The word the LINE used, from core's one level scan — never
-                  // the severity vocabulary's name for it, which appears nowhere
-                  // in the log the reader is grepping against.
-                  //
-                  // And no `tone` beside it. The kit owns level→tone precisely
-                  // so the same word is not red here and grey on the next
-                  // screen; an override belongs to a line singled out for some
-                  // reason OTHER than its level, and none is.
-                  level={row.level}
-                  // A cut line says so at its end, in the message's own flow: the
-                  // trailing slot sits beside the message box, and with Wrap off a
-                  // long message runs past that box and under it.
-                  message={
-                    row.truncated ? (
-                      <>
-                        {row.message}
-                        <span className="text-faint"> [line cut: too long]</span>
-                      </>
-                    ) : (
-                      row.message
-                    )
-                  }
-                />
+                  aria-current={row === selected ? "true" : undefined}
+                  onClick={() => {
+                    // A drag that selected text to copy is not a request for the panel.
+                    if (window.getSelection()?.toString()) return;
+                    // Reading this line, not following: a new line must not carry it away, and the panel
+                    // opening takes the bottom of the pane, where this row may be.
+                    stickRef.current = false;
+                    revealRef.current = true;
+                    setSelected(row);
+                    // Same row again: no render is coming to reveal it.
+                    if (row === selected) revealSelected();
+                  }}
+                  className="cursor-pointer"
+                  style={row === selected ? { background: toneWash("accent") } : undefined}
+                >
+                  <LogLine
+                    ts={row.ts}
+                    source={sourceOf(row, " · ")}
+                    // The word the LINE used, from core's one level scan — never
+                    // the severity vocabulary's name for it, which appears nowhere
+                    // in the log the reader is grepping against.
+                    //
+                    // And no `tone` beside it. The kit owns level→tone precisely
+                    // so the same word is not red here and grey on the next
+                    // screen; an override belongs to a line singled out for some
+                    // reason OTHER than its level, and none is.
+                    level={row.level}
+                    message={renderMessage(row, clauses)}
+                  />
+                </div>
               ))}
               {window_.bottomPad > 0 && (
                 <div style={{ height: window_.bottomPad }} aria-hidden="true" />
@@ -1488,6 +1821,15 @@ function LogsStream({
             </div>
           )}
         </div>
+        {selected !== null && (
+          <LineDetail
+            line={selected}
+            inView={selectedIndex >= 0}
+            clauses={clauses}
+            onToggle={toggleFilter}
+            onClose={closeDetail}
+          />
+        )}
       </SideRail>
     </LogsScreen>
   );
