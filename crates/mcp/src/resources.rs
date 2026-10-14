@@ -146,6 +146,12 @@ pub enum KindScope {
 /// `gvk_for`; a second table here would drift.
 pub trait KindResolver: Send + Sync {
     fn scope(&self, kind: &str) -> Option<KindScope>;
+
+    /// The API kind used by Event `involvedObject.kind` selectors.
+    /// Resolvers accepting aliases must return the same kind their watcher uses.
+    fn canonical_kind(&self, kind: &str) -> String {
+        kind.to_string()
+    }
 }
 
 /// The default. A host that wires no resolver exposes no object resources —
@@ -349,7 +355,7 @@ pub fn plan_read(uri: &ResourceUri, kinds: &dyn KindResolver) -> Result<Resource
             args: json!({
                 "context": context,
                 "namespace": namespace.clone().unwrap_or_default(),
-                "objectKind": kind,
+                "objectKind": kinds.canonical_kind(kind),
                 "objectName": name,
             }),
             mime: "application/json",

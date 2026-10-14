@@ -4546,7 +4546,8 @@ async fn mcp_event_resource_subscription(ctx: &str, namespace: &str) {
     };
     apply(parent_manifest.clone()).await;
 
-    let uri_text = format!("k8s://{ctx}/{namespace}/ConfigMap/{parent}/events");
+    // An accepted alias must select ConfigMap Events on both watch and read.
+    let uri_text = format!("k8s://{ctx}/{namespace}/cm/{parent}/events");
     let uri = srelens_mcp::resources::ResourceUri::parse(&uri_text).unwrap();
     assert!(srelens_mcp::resources::is_subscribable(&uri).is_ok());
     let (tx, mut changes) = tokio::sync::mpsc::unbounded_channel();
